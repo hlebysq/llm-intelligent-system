@@ -1,0 +1,115 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: llm-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - llm-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: llm-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - llm-network
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: llm-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - llm-network
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: cmd/api-gateway/Dockerfile
+    container_name: llm-api-gateway
+    ports:
+      - "${API_GATEWAY_PORT}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DB_HOST=${DB_HOST}
+      - DB_PORT=${DB_PORT}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      - REDIS_HOST=${REDIS_HOST}
+      - REDIS_PORT=${REDIS_PORT}
+      - JWT_SECRET=${JWT_SECRET}
+      - ENVIRONMENT=${ENVIRONMENT}
+    networks:
+      - llm-network
+    restart: unless-stopped
+
+  model-proxy:
+    build:
+      context: .
+      dockerfile: cmd/model-proxy/Dockerfile
+    container_name: llm-model-proxy
+    ports:
+      - "${MODEL_PROXY_PORT}:8081"
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_URL=${OLLAMA_URL}
+      - MODEL_NAME=llama3.2
+      - ENVIRONMENT=${ENVIRONMENT}
+    networks:
+      - llm-network
+    restart: unless-stopped
+
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: cmd/telegram-bot/Dockerfile
+    container_name: llm-telegram-bot
+    depends_on:
+      - api-gateway
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - API_GATEWAY_URL=${TELEGRAM_API_GATEWAY_URL}
+      - ENVIRONMENT=${ENVIRONMENT}
+    networks:
+      - llm-network
+    restart: unless-stopped
+
+networks:
+  llm-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_data:
