@@ -21,7 +21,7 @@ type Config struct {
 	DB       int
 }
 
-// NewRedisClient создает нового Redis клиента
+// NewRedisClient creates a Redis client and verifies connectivity.
 func NewRedisClient(cfg Config, logger *zap.Logger) (*RedisClient, error) {
 	client := redis.NewClient(&redis.Options{
 		Addr:         fmt.Sprintf("%s:%s", cfg.Host, cfg.Port),
@@ -33,7 +33,6 @@ func NewRedisClient(cfg Config, logger *zap.Logger) (*RedisClient, error) {
 		PoolSize:     10,
 	})
 
-	// Проверка соединения
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -46,13 +45,9 @@ func NewRedisClient(cfg Config, logger *zap.Logger) (*RedisClient, error) {
 		zap.String("port", cfg.Port),
 	)
 
-	return &RedisClient{
-		client: client,
-		logger: logger,
-	}, nil
+	return &RedisClient{client: client, logger: logger}, nil
 }
 
-// Get получает значение из кэша
 func (r *RedisClient) Get(ctx context.Context, key string) (string, error) {
 	val, err := r.client.Get(ctx, key).Result()
 	if err == redis.Nil {
@@ -61,29 +56,54 @@ func (r *RedisClient) Get(ctx context.Context, key string) (string, error) {
 	return val, err
 }
 
-// Set устанавливает значение в кэш с TTL
 func (r *RedisClient) Set(ctx context.Context, key string, value interface{}, ttl time.Duration) error {
 	return r.client.Set(ctx, key, value, ttl).Err()
 }
 
-// Delete удаляет ключ из кэша
 func (r *RedisClient) Delete(ctx context.Context, key string) error {
 	return r.client.Del(ctx, key).Err()
 }
 
-// Exists проверяет существование ключа
 func (r *RedisClient) Exists(ctx context.Context, key string) (bool, error) {
 	n, err := r.client.Exists(ctx, key).Result()
 	return n > 0, err
 }
 
-// Close закрывает соединение с Redis
+func (r *RedisClient) AllowRateLimit(ctx context.Context, key string, limit int, window time.Duration) (bool, int, time.Duration, error) {
+	pipe := r.client.TxPipeline()
+	countCmd := pipe.Incr(ctx, key)
+	ttlCmd := pipe.TTL(ctx, key)
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return false, 0, 0, err
+	}
+
+	count := int(countCmd.Val())
+	ttl := ttlCmd.Val()
+	if count == 1 || ttl < 0 {
+		if err := r.client.Expire(ctx, key, window).Err(); err != nil {
+			return false, 0, 0, err
+		}
+		ttl = window
+	}
+
+	remaining := limit - count
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	return count <= limit, remaining, ttl, nil
+}
+
+func NewTestClient(client *redis.Client) *RedisClient {
+	return &RedisClient{client: client, logger: zap.NewNop()}
+}
+
 func (r *RedisClient) Close() error {
 	r.logger.Info("Closing Redis connection")
 	return r.client.Close()
 }
 
-// HealthCheck проверяет состояние Redis
 func (r *RedisClient) HealthCheck() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

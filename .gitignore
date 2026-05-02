@@ -23,9 +23,15 @@ profile.cov
 # Go workspace file
 go.work
 go.work.sum
+.gocache/
+./gomodcache/
+
+# Python workspace file
+__pycache__/
 
 # env file
 .env
+.venv/
 
 # Editor/IDE
 # .idea/

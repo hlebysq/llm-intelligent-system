@@ -56,6 +56,11 @@ func NewPostgresDB(cfg Config, logger *zap.Logger) (*DB, error) {
 	}, nil
 }
 
+// NewTestDB оборачивает существующий *sql.DB для использования в тестах.
+func NewTestDB(db *sql.DB) *DB {
+	return &DB{DB: db, logger: zap.NewNop()}
+}
+
 // Close закрывает соединение с БД
 func (db *DB) Close() error {
 	db.logger.Info("Closing database connection")

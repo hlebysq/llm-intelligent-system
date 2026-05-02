@@ -1,0 +1,615 @@
+openapi: 3.0.3
+info:
+  title: LLM Intelligent System API Gateway
+  version: 1.0.0
+  description: >
+    API gateway for authentication, LLM query orchestration, query logs, and Telegram user mode management.
+    The gateway stores request history in PostgreSQL, checks Redis health, and forwards
+    model calls to the debate orchestrator. Telegram clients authenticate with a service account and pass
+    `telegram_id` in query requests so that user history is stored per Telegram user.
+servers:
+  - url: http://localhost:{port}
+    description: Local host port published by Docker Compose
+    variables:
+      port:
+        default: '8080'
+        description: Host-side API gateway port. In Docker Compose this is API_GATEWAY_PORT.
+  - url: http://api-gateway:8080
+    description: Internal Docker network address used by other services
+tags:
+  - name: Auth
+    description: JWT authentication endpoints.
+  - name: System
+    description: Health checks and API documentation endpoints.
+  - name: Queries
+    description: Authenticated LLM requests and query history.
+  - name: Users
+    description: Telegram user preferences.
+paths:
+  /docs:
+    get:
+      tags: [System]
+      operationId: getSwaggerUI
+      summary: Open Swagger UI
+      description: Returns the embedded Swagger UI HTML page. The page loads this API document from `/openapi.yaml`.
+      responses:
+        '200':
+          description: Swagger UI HTML page
+          content:
+            text/html:
+              schema:
+                type: string
+  /docs/:
+    get:
+      tags: [System]
+      operationId: getSwaggerUIWithSlash
+      summary: Open Swagger UI
+      description: Same as `/docs`; this route exists so both slash variants work.
+      responses:
+        '200':
+          description: Swagger UI HTML page
+          content:
+            text/html:
+              schema:
+                type: string
+  /openapi.yaml:
+    get:
+      tags: [System]
+      operationId: getOpenAPISpec
+      summary: Get OpenAPI specification
+      description: Returns the Swagger/OpenAPI document for the API gateway in YAML format.
+      responses:
+        '200':
+          description: OpenAPI document
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Login user
+      description: >
+        Authenticates a database user by username and password and returns a JWT token.
+        The seed migrations create `testuser` and `telegram_bot`; both use the development password
+        `password123` unless the database seed is changed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              user:
+                summary: Regular test user
+                value:
+                  username: testuser
+                  password: password123
+              telegramBot:
+                summary: Telegram bot service account
+                value:
+                  username: telegram_bot
+                  password: password123
+      responses:
+        '200':
+          description: Successful login
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Token generation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/v1/health:
+    get:
+      tags: [System]
+      operationId: getHealth
+      summary: Check gateway health
+      description: >
+        Returns aggregate health of PostgreSQL and Redis dependencies. The endpoint returns HTTP 503 when
+        at least one dependency is not healthy.
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                healthy:
+                  value:
+                    status: healthy
+                    service: api-gateway
+                    timestamp: '2026-04-29T01:20:00Z'
+                    checks:
+                      postgres: healthy
+                      redis: healthy
+        '503':
+          description: One or more dependencies are unhealthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                postgresDown:
+                  value:
+                    status: unhealthy
+                    service: api-gateway
+                    timestamp: '2026-04-29T01:20:00Z'
+                    checks:
+                      postgres: 'unhealthy: dial tcp postgres:5432: connect: connection refused'
+                      redis: healthy
+  /api/v1/query:
+    post:
+      tags: [Queries]
+      operationId: createQuery
+      summary: Send prompt to LLM
+      description: >
+        Processes a user prompt, enriches it with recent chat history, routes the request
+        to either the analytics or simple orchestrator, stores the interaction, and returns
+        the final response. If `telegram_id` is provided, the gateway finds or creates the matching
+        Telegram user and stores chat/query history under that user. Without `telegram_id`, history is
+        stored under the authenticated JWT user.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+            examples:
+              analytics:
+                summary: Analytics mode with debate orchestration
+                value:
+                  prompt: Explain why model evaluation needs both automated and human checks.
+                  mode: analytics
+              telegramSimple:
+                summary: Telegram user in simple mode
+                value:
+                  prompt: Summarize the last answer in two sentences.
+                  telegram_id: 422839853
+                  telegram_username: gleb
+                  mode: simple
+      responses:
+        '200':
+          description: Query processed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResponse'
+              examples:
+                success:
+                  value:
+                    response: Model evaluation needs automated checks for scale and human checks for judgment-heavy quality signals.
+                    model_used: debate-ensemble
+                    processing_time_ms: 1520
+        '400':
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid JWT token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Query rate limit exceeded
+          headers:
+            Retry-After:
+              description: Seconds until the current rate-limit window resets.
+              schema:
+                type: integer
+            X-RateLimit-Limit:
+              description: Maximum number of query requests allowed in the window.
+              schema:
+                type: integer
+            X-RateLimit-Remaining:
+              description: Number of remaining query requests in the current window.
+              schema:
+                type: integer
+            X-RateLimit-Reset:
+              description: Unix timestamp when the current window resets.
+              schema:
+                type: integer
+                format: int64
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Failed to process query
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/v1/history:
+    get:
+      tags: [Queries]
+      operationId: getQueryHistory
+      summary: Get query history
+      description: >
+        Returns up to 50 latest query log entries for the authenticated JWT user, ordered from newest to oldest.
+        For Telegram conversations, query logs are written under the resolved Telegram user, so the service
+        account history may differ from end-user history.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Query history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HistoryResponse'
+              examples:
+                withItems:
+                  value:
+                    history:
+                      - id: 72af6f2b-7f0a-4a81-9f0c-106c51c0fc35
+                        user_id: 22663de0-b0e9-4366-8ab3-dedaf1748179
+                        original_query: Explain how retrieval augmented generation works.
+                        model_used: debate-ensemble
+                        response_text: Retrieval augmented generation combines search with model inference.
+                        latency_ms: 1520
+                        status: success
+                        created_at: '2026-04-29T01:20:00Z'
+                    count: 1
+        '401':
+          description: Missing or invalid JWT token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Failed to fetch history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /api/v1/users/mode:
+    get:
+      tags: [Users]
+      operationId: getTelegramUserMode
+      summary: Get Telegram user mode
+      description: >
+        Returns the saved processing mode for a Telegram user. If the Telegram user has not been created yet,
+        the gateway returns `analytics` without creating a user record.
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: telegram_id
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            example: 422839853
+          description: Telegram user ID.
+      responses:
+        '200':
+          description: Current user mode
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserModeResponse'
+        '400':
+          description: telegram_id is missing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid JWT token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    put:
+      tags: [Users]
+      operationId: setTelegramUserMode
+      summary: Set Telegram user mode
+      description: >
+        Saves the preferred processing mode for a Telegram user. The current implementation updates existing
+        users by `telegram_id`; a Telegram user is normally created by sending `/api/v1/query` with `telegram_id`
+        at least once.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetModeRequest'
+            examples:
+              simple:
+                value:
+                  telegram_id: 422839853
+                  mode: simple
+              analytics:
+                value:
+                  telegram_id: 422839853
+                  mode: analytics
+      responses:
+        '200':
+          description: Mode updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserModeResponse'
+        '400':
+          description: Invalid request body or unsupported mode
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Missing or invalid JWT token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Failed to update mode
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        JWT returned by `/api/v1/auth/login`. Send it as `Authorization: Bearer <token>`.
+  schemas:
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 1
+          example: testuser
+        password:
+          type: string
+          format: password
+          minLength: 1
+          example: password123
+    LoginResponse:
+      type: object
+      required: [token, expires_at, user]
+      properties:
+        token:
+          type: string
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        expires_at:
+          type: string
+          format: date-time
+          example: '2026-04-30T01:20:00Z'
+        user:
+          $ref: '#/components/schemas/User'
+    User:
+      type: object
+      required: [id, username, email, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 22663de0-b0e9-4366-8ab3-dedaf1748179
+        username:
+          type: string
+          example: telegram_bot
+        email:
+          type: string
+          format: email
+          example: bot@internal.local
+        telegram_id:
+          type: integer
+          format: int64
+          nullable: true
+          example: 422839853
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-04-29T01:00:00Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-04-29T01:00:00Z'
+    QueryRequest:
+      type: object
+      required: [prompt]
+      properties:
+        prompt:
+          type: string
+          minLength: 1
+          description: User prompt. The gateway prepends recent chat context before forwarding it to the orchestrator.
+          example: Explain how retrieval augmented generation works.
+        telegram_id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Telegram user ID. When present, the gateway stores history under the resolved Telegram user.
+          example: 422839853
+        telegram_username:
+          type: string
+          description: Optional Telegram username, used only as metadata when creating a Telegram user record.
+          example: gleb
+        mode:
+          type: string
+          description: Processing mode. `simple` calls the simple orchestrator endpoint; `analytics` uses debate orchestration. Omitted values use analytics behavior.
+          enum: [simple, analytics]
+          example: analytics
+    QueryResponse:
+      type: object
+      required: [response, model_used, processing_time_ms]
+      properties:
+        response:
+          type: string
+          example: Retrieval augmented generation combines search with model inference.
+        model_used:
+          type: string
+          description: Model identifier returned by the orchestrator, or `unknown` when it is absent.
+          example: debate-ensemble
+        processing_time_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Gateway-side processing time in milliseconds.
+          example: 1520
+    ChatMessage:
+      type: object
+      required: [id, user_id, role, content, created_at]
+      description: Internal chat-history record used to enrich future prompts. It is not returned by the public API today.
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: d571e3f4-f5fb-4f64-9a43-821f5276ec0a
+        user_id:
+          type: string
+          format: uuid
+          example: 22663de0-b0e9-4366-8ab3-dedaf1748179
+        role:
+          type: string
+          enum: [user, assistant]
+          example: user
+        content:
+          type: string
+          example: Explain how retrieval augmented generation works.
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-04-29T01:20:00Z'
+    QueryLog:
+      type: object
+      required: [id, original_query, model_used, response_text, latency_ms, status, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 72af6f2b-7f0a-4a81-9f0c-106c51c0fc35
+        user_id:
+          type: string
+          format: uuid
+          nullable: true
+          example: 22663de0-b0e9-4366-8ab3-dedaf1748179
+        original_query:
+          type: string
+          example: Explain how retrieval augmented generation works.
+        model_used:
+          type: string
+          nullable: true
+          example: debate-ensemble
+        response_text:
+          type: string
+          nullable: true
+          example: Retrieval augmented generation combines search with model inference.
+        latency_ms:
+          type: integer
+          nullable: true
+          minimum: 0
+          example: 1520
+        status:
+          type: string
+          enum: [success, error]
+          example: success
+        error_message:
+          type: string
+          nullable: true
+          example: null
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-04-29T01:20:00Z'
+    HistoryResponse:
+      type: object
+      required: [history, count]
+      properties:
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/QueryLog'
+        count:
+          type: integer
+          example: 12
+    SetModeRequest:
+      type: object
+      required: [telegram_id, mode]
+      properties:
+        telegram_id:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 422839853
+        mode:
+          type: string
+          enum: [simple, analytics]
+          example: simple
+    UserModeResponse:
+      type: object
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [simple, analytics]
+          example: analytics
+    ErrorResponse:
+      type: object
+      required: [error, code]
+      properties:
+        error:
+          type: string
+          example: Invalid credentials
+        code:
+          type: integer
+          format: int32
+          example: 401
+        details:
+          type: string
+          nullable: true
+          example: "Key: 'LoginRequest.Username' Error:Field validation for 'Username' failed on the 'required' tag"
+    HealthResponse:
+      type: object
+      required: [status, service, timestamp]
+      properties:
+        status:
+          type: string
+          enum: [healthy, unhealthy]
+          example: healthy
+        service:
+          type: string
+          example: api-gateway
+        timestamp:
+          type: string
+          format: date-time
+          example: '2026-04-29T01:20:00Z'
+        checks:
+          type: object
+          description: Dependency health keyed by dependency name.
+          additionalProperties:
+            type: string
+          example:
+            postgres: healthy
+            redis: healthy

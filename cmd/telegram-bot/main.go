@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,19 +19,117 @@ import (
 	"github.com/hlebysq/llm-intelligent-system/internal/logger"
 )
 
+const (
+	modeSimple    = "simple"
+	modeAnalytics = "analytics"
+)
+
 type TelegramBot struct {
 	bot           *tgbotapi.BotAPI
 	logger        *zap.Logger
 	apiGatewayURL string
 	jwtToken      string
 	httpClient    *http.Client
+
+	modesMu sync.RWMutex
+	modes   map[int64]string // chatID → режим
+}
+
+// getMode возвращает текущий режим для чата (только из in-memory кэша).
+func (tb *TelegramBot) getMode(chatID int64) string {
+	tb.modesMu.RLock()
+	defer tb.modesMu.RUnlock()
+	if m, ok := tb.modes[chatID]; ok {
+		return m
+	}
+	return modeAnalytics
+}
+
+// setMode сохраняет режим в памяти.
+func (tb *TelegramBot) setMode(chatID int64, mode string) {
+	tb.modesMu.Lock()
+	defer tb.modesMu.Unlock()
+	tb.modes[chatID] = mode
+}
+
+// ensureModeLoaded подгружает режим из БД при первом обращении после рестарта бота.
+func (tb *TelegramBot) ensureModeLoaded(chatID int64) {
+	tb.modesMu.RLock()
+	_, loaded := tb.modes[chatID]
+	tb.modesMu.RUnlock()
+	if loaded {
+		return
+	}
+
+	mode, err := tb.fetchUserMode(chatID)
+	if err != nil {
+		tb.logger.Warn("Failed to fetch user mode, using default",
+			zap.Int64("chat_id", chatID), zap.Error(err))
+		mode = modeAnalytics
+	}
+	tb.setMode(chatID, mode)
+}
+
+// fetchUserMode запрашивает сохранённый режим пользователя через API Gateway.
+func (tb *TelegramBot) fetchUserMode(chatID int64) (string, error) {
+	url := fmt.Sprintf("%s/api/v1/users/mode?telegram_id=%d", tb.apiGatewayURL, chatID)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return modeAnalytics, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tb.jwtToken)
+
+	resp, err := tb.httpClient.Do(req)
+	if err != nil {
+		return modeAnalytics, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return modeAnalytics, fmt.Errorf("gateway returned %d", resp.StatusCode)
+	}
+
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return modeAnalytics, err
+	}
+	return body.Mode, nil
+}
+
+// persistUserMode сохраняет режим пользователя в БД через API Gateway.
+func (tb *TelegramBot) persistUserMode(chatID int64, mode string) {
+	url := tb.apiGatewayURL + "/api/v1/users/mode"
+	body, _ := json.Marshal(map[string]interface{}{
+		"telegram_id": chatID,
+		"mode":        mode,
+	})
+
+	req, err := http.NewRequest(http.MethodPut, url, bytes.NewBuffer(body))
+	if err != nil {
+		tb.logger.Error("Failed to create mode request", zap.Error(err))
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+tb.jwtToken)
+
+	resp, err := tb.httpClient.Do(req)
+	if err != nil {
+		tb.logger.Error("Failed to persist user mode", zap.Error(err))
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		tb.logger.Warn("Unexpected status when persisting mode",
+			zap.Int("status", resp.StatusCode), zap.Int64("chat_id", chatID))
+	}
 }
 
 func main() {
-	// Загрузка переменных окружения
 	_ = godotenv.Load()
 
-	// Инициализация логгера
 	env := getEnv("ENVIRONMENT", "development")
 	if err := logger.InitLogger(env); err != nil {
 		panic(fmt.Sprintf("Failed to initialize logger: %v", err))
@@ -40,7 +139,6 @@ func main() {
 	log := logger.GetLogger()
 	log.Info("Starting Telegram Bot", zap.String("environment", env))
 
-	// Инициализация Telegram Bot API
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if botToken == "" {
 		log.Fatal("TELEGRAM_BOT_TOKEN is not set")
@@ -51,59 +149,52 @@ func main() {
 		log.Fatal("Failed to create bot", zap.Error(err))
 	}
 
-	// Включение debug режима в development
 	if env == "development" {
 		bot.Debug = true
 	}
 
 	log.Info("Authorized on account", zap.String("username", bot.Self.UserName))
 
-	// Создание HTTP клиента
 	httpClient := &http.Client{
-		Timeout: 60 * time.Second,
+		Timeout: 600 * time.Second,
 	}
 
-	// Создание бота
 	telegramBot := &TelegramBot{
 		bot:           bot,
 		logger:        log,
 		apiGatewayURL: getEnv("API_GATEWAY_URL", "http://localhost:8080"),
 		httpClient:    httpClient,
+		modes:         make(map[int64]string),
 	}
 
-	// Получение JWT токена
 	if err := telegramBot.authenticate(); err != nil {
 		log.Fatal("Failed to authenticate", zap.Error(err))
 	}
 
-	// Настройка обновлений
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
 	updates := bot.GetUpdatesChan(u)
 
-	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	log.Info("Bot is running. Press Ctrl+C to stop.")
 
-	// Обработка обновлений
 	go telegramBot.handleUpdates(updates)
 
-	// Ожидание сигнала завершения
 	<-quit
 	log.Info("Shutting down bot...")
 	bot.StopReceivingUpdates()
 	log.Info("Bot stopped")
 }
 
-// Аутентификация в API Gateway
+// Аутентификация в API Gateway (сервисный аккаунт Telegram-бота)
 func (tb *TelegramBot) authenticate() error {
 	loginURL := tb.apiGatewayURL + "/api/v1/auth/login"
 
 	requestBody := map[string]string{
-		"username": "testuser",
+		"username": "telegram_bot",
 		"password": "password123",
 	}
 
@@ -141,6 +232,12 @@ func (tb *TelegramBot) authenticate() error {
 // Обработка обновлений от Telegram
 func (tb *TelegramBot) handleUpdates(updates tgbotapi.UpdatesChannel) {
 	for update := range updates {
+		// Нажатие inline-кнопки
+		if update.CallbackQuery != nil {
+			tb.handleCallbackQuery(update.CallbackQuery)
+			continue
+		}
+
 		if update.Message == nil {
 			continue
 		}
@@ -163,30 +260,60 @@ func (tb *TelegramBot) handleUpdates(updates tgbotapi.UpdatesChannel) {
 	}
 }
 
+// handleCallbackQuery обрабатывает нажатия inline-кнопок (смена режима).
+func (tb *TelegramBot) handleCallbackQuery(query *tgbotapi.CallbackQuery) {
+	// Подтверждаем callback, чтобы убрать индикатор загрузки на кнопке
+	tb.bot.Request(tgbotapi.NewCallback(query.ID, ""))
+
+	chatID := query.Message.Chat.ID
+	msgID := query.Message.MessageID
+
+	switch query.Data {
+	case "mode:simple":
+		tb.setMode(chatID, modeSimple)
+		go tb.persistUserMode(chatID, modeSimple)
+		tb.editMessage(chatID, msgID,
+			"✅ Режим переключён: 💬 Обычный\n\n"+
+				"Один быстрый вызов модели — идеально для коротких вопросов.")
+	case "mode:analytics":
+		tb.setMode(chatID, modeAnalytics)
+		go tb.persistUserMode(chatID, modeAnalytics)
+		tb.editMessage(chatID, msgID,
+			"✅ Режим переключён: 🔬 Аналитический\n\n"+
+				"Консилиум из нескольких моделей — для сложных и неоднозначных вопросов.")
+	}
+}
+
 // Обработка команд
 func (tb *TelegramBot) handleCommand(message *tgbotapi.Message) {
 	switch message.Command() {
 	case "start":
 		tb.sendMessage(message.Chat.ID,
 			"👋 Привет! Я бот для работы с языковыми моделями.\n\n"+
-				"Просто отправь мне любой вопрос, и я передам его нейросети для обработки!\n\n"+
+				"Просто отправь мне любой вопрос!\n\n"+
 				"Команды:\n"+
 				"/start - начать работу\n"+
 				"/help - помощь\n"+
+				"/mode - сменить режим обработки\n"+
 				"/history - история запросов",
 		)
 
 	case "help":
 		tb.sendMessage(message.Chat.ID,
 			"ℹ️ Как пользоваться:\n\n"+
-				"1. Просто напиши свой вопрос\n"+
-				"2. Я отправлю его языковой модели\n"+
-				"3. Получишь ответ через несколько секунд\n\n"+
+				"1. Напиши свой вопрос\n"+
+				"2. Выбери режим командой /mode:\n"+
+				"   💬 Обычный — быстрый ответ от одной модели\n"+
+				"   🔬 Аналитический — консилиум моделей, дольше но точнее\n"+
+				"3. Получишь ответ\n\n"+
 				"Примеры:\n"+
 				"- Объясни квантовую физику простыми словами\n"+
 				"- Напиши стихотворение про осень\n"+
 				"- Как работает блокчейн?",
 		)
+
+	case "mode":
+		tb.handleModeCommand(message.Chat.ID)
 
 	case "history":
 		tb.handleHistoryCommand(message.Chat.ID)
@@ -198,44 +325,125 @@ func (tb *TelegramBot) handleCommand(message *tgbotapi.Message) {
 	}
 }
 
+// handleModeCommand показывает текущий режим и кнопки для переключения.
+func (tb *TelegramBot) handleModeCommand(chatID int64) {
+	tb.ensureModeLoaded(chatID)
+	current := tb.getMode(chatID)
+
+	var currentLabel string
+	if current == modeSimple {
+		currentLabel = "💬 Обычный"
+	} else {
+		currentLabel = "🔬 Аналитический"
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("💬 Обычный", "mode:simple"),
+			tgbotapi.NewInlineKeyboardButtonData("🔬 Аналитический", "mode:analytics"),
+		),
+	)
+
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf(
+		"⚙️ Текущий режим: %s\n\nВыбери режим обработки запросов:", currentLabel,
+	))
+	msg.ReplyMarkup = keyboard
+
+	if _, err := tb.bot.Send(msg); err != nil {
+		tb.logger.Error("Failed to send mode keyboard", zap.Error(err))
+	}
+}
+
 // Обработка текстовых сообщений
 func (tb *TelegramBot) handleMessage(message *tgbotapi.Message) {
 	chatID := message.Chat.ID
+	tb.ensureModeLoaded(chatID)
+	mode := tb.getMode(chatID)
 
-	// Отправка индикатора "печатает..."
-	typingAction := tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)
-	tb.bot.Send(typingAction)
+	type progressStage struct {
+		delay time.Duration
+		text  string
+	}
 
-	// Отправка запроса к API Gateway
-	response, processingTime, err := tb.queryLLM(message.Text)
+	var stages []progressStage
+	var initialText string
+
+	if mode == modeSimple {
+		initialText = "⏳ Отправляю запрос к модели..."
+		stages = []progressStage{
+			{6 * time.Second, "🤔 Модель формулирует ответ..."},
+		}
+	} else {
+		initialText = "⏳ Запрос принят, запускаю консилиум моделей..."
+		stages = []progressStage{
+			{8 * time.Second, "🤔 Дебатёры формулируют начальные ответы..."},
+			{14 * time.Second, "⚔️ Модели анализируют позиции друг друга..."},
+			{16 * time.Second, "✍️ Каждый дебатёр уточняет свою версию..."},
+			{17 * time.Second, "⚖️ Судья анализирует все позиции и выносит вердикт..."},
+		}
+	}
+
+	// Сразу отправляем сообщение-заглушку и запоминаем его ID
+	statusMsg, err := tb.sendMessageAndGetID(chatID, initialText)
 	if err != nil {
+		tb.logger.Error("Failed to send initial message", zap.Error(err))
+		return
+	}
+	msgID := statusMsg.MessageID
+
+	// Запускаем LLM-запрос в фоне
+	type queryResult struct {
+		response string
+		procTime int64
+		err      error
+	}
+	resultCh := make(chan queryResult, 1)
+	go func() {
+		resp, t, err := tb.queryLLM(message.Text, message.Chat.ID, message.From.UserName, mode)
+		resultCh <- queryResult{resp, t, err}
+	}()
+
+	// Горутина обновляет статусное сообщение по таймерам
+	doneCh := make(chan struct{})
+	go func() {
+		for _, s := range stages {
+			select {
+			case <-time.After(s.delay):
+				tb.editMessage(chatID, msgID, s.text)
+			case <-doneCh:
+				return
+			}
+		}
+	}()
+
+	// Ждём результата и закрываем прогресс
+	res := <-resultCh
+	close(doneCh)
+
+	if res.err != nil {
 		tb.logger.Error("Failed to query LLM",
-			zap.Error(err),
+			zap.Error(res.err),
 			zap.Int64("chat_id", chatID),
 		)
-		tb.sendMessage(chatID,
-			"❌ Произошла ошибка при обработке запроса. Попробуйте позже.",
-		)
+		tb.editMessage(chatID, msgID, "❌ Произошла ошибка при обработке запроса. Попробуйте позже.")
 		return
 	}
 
-	// Формирование ответа с метаданными
-	fullResponse := fmt.Sprintf(
-		"%s\n\n⏱️ Время обработки: %dмс",
-		response,
-		processingTime,
-	)
-
-	// Отправка ответа
-	tb.sendMessage(chatID, fullResponse)
+	finalText := fmt.Sprintf("%s\n\n⏱️ Время обработки: %dмс", res.response, res.procTime)
+	tb.editMessage(chatID, msgID, finalText)
 }
 
-// Запрос к LLM через API Gateway
-func (tb *TelegramBot) queryLLM(prompt string) (string, int64, error) {
+// Запрос к LLM через API Gateway.
+// telegramID и telegramUsername передаются для разделения истории по пользователям.
+// mode: "simple" — один вызов модели, "analytics" — полный дебат.
+func (tb *TelegramBot) queryLLM(prompt string, telegramID int64, telegramUsername string, mode string) (string, int64, error) {
 	queryURL := tb.apiGatewayURL + "/api/v1/query"
 
-	requestBody := map[string]string{
-		"prompt": prompt,
+	requestBody := map[string]interface{}{
+		"prompt":            prompt,
+		"telegram_id":       telegramID,
+		"telegram_username": telegramUsername,
+		"mode":              mode,
 	}
 
 	jsonData, err := json.Marshal(requestBody)
@@ -370,6 +578,28 @@ func (tb *TelegramBot) sendMessage(chatID int64, text string) {
 		tb.logger.Error("Failed to send message",
 			zap.Error(err),
 			zap.Int64("chat_id", chatID),
+		)
+	}
+}
+
+// Отправка сообщения с возвратом объекта (нужен MessageID для последующих правок)
+func (tb *TelegramBot) sendMessageAndGetID(chatID int64, text string) (tgbotapi.Message, error) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	sent, err := tb.bot.Send(msg)
+	if err != nil {
+		tb.logger.Error("Failed to send message", zap.Error(err), zap.Int64("chat_id", chatID))
+	}
+	return sent, err
+}
+
+// Редактирование уже отправленного сообщения
+func (tb *TelegramBot) editMessage(chatID int64, messageID int, text string) {
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	if _, err := tb.bot.Send(edit); err != nil {
+		tb.logger.Warn("Failed to edit message",
+			zap.Error(err),
+			zap.Int64("chat_id", chatID),
+			zap.Int("message_id", messageID),
 		)
 	}
 }

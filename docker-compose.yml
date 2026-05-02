@@ -36,17 +36,6 @@ services:
     networks:
       - llm-network
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: llm-ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    networks:
-      - llm-network
-    restart: unless-stopped
-
   api-gateway:
     build:
       context: .
@@ -59,6 +48,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      debate-orchestrator:
+        condition: service_started
     environment:
       - DB_HOST=${DB_HOST}
       - DB_PORT=${DB_PORT}
@@ -68,23 +59,33 @@ services:
       - REDIS_HOST=${REDIS_HOST}
       - REDIS_PORT=${REDIS_PORT}
       - JWT_SECRET=${JWT_SECRET}
+      - DEBATE_ORCHESTRATOR_ANALYTICS_URL=http://debate-orchestrator:8082/api/v1/generate
+      - DEBATE_ORCHESTRATOR_SIMPLE_URL=http://debate-orchestrator:8082/api/v1/simple
+      - QUERY_RATE_LIMIT_REQUESTS=${QUERY_RATE_LIMIT_REQUESTS:-20}
+      - QUERY_RATE_LIMIT_WINDOW_SECONDS=${QUERY_RATE_LIMIT_WINDOW_SECONDS:-60}
       - ENVIRONMENT=${ENVIRONMENT}
     networks:
       - llm-network
     restart: unless-stopped
 
-  model-proxy:
+  debate-orchestrator:
     build:
-      context: .
-      dockerfile: cmd/model-proxy/Dockerfile
-    container_name: llm-model-proxy
+      context: ./debate-orchestrator
+      dockerfile: Dockerfile
+    container_name: llm-debate-orchestrator
     ports:
-      - "${MODEL_PROXY_PORT}:8081"
-    depends_on:
-      - ollama
+      - "${DEBATE_ORCHESTRATOR_PORT:-8082}:8082"
     environment:
-      - OLLAMA_URL=${OLLAMA_URL}
-      - MODEL_NAME=llama3.2
+      - YANDEX_API_KEY=${YANDEX_API_KEY}
+      - DEBATER_A_MODEL=${DEBATER_A_MODEL:-yandexgpt-lite}
+      - DEBATER_B_MODEL=${DEBATER_B_MODEL:-deepseek-v3}
+      - DEBATER_C_MODEL=${DEBATER_C_MODEL:-yandexgpt-lite}
+      - JUDGE_MODEL=${JUDGE_MODEL:-yandexgpt}
+      - DEBATER_MAX_TOKENS=${DEBATER_MAX_TOKENS:-1024}
+      - JUDGE_MAX_TOKENS=${JUDGE_MAX_TOKENS:-2048}
+      - SIMPLE_MODEL=${SIMPLE_MODEL:-yandexgpt-lite}
+      - SIMPLE_MAX_TOKENS=${SIMPLE_MAX_TOKENS:-1000}
+      - DEBUG_BACKEND=${DEBUG_BACKEND:-false}
       - ENVIRONMENT=${ENVIRONMENT}
     networks:
       - llm-network
@@ -112,4 +113,3 @@ networks:
 volumes:
   postgres_data:
   redis_data:
-  ollama_data:

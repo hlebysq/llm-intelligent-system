@@ -3,14 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"database/sql"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,12 +29,27 @@ import (
 )
 
 type Server struct {
-	router     *gin.Engine
-	db         *database.DB
-	cache      *cache.RedisClient
-	jwtManager *auth.JWTManager
-	logger     *zap.Logger
+	router         *gin.Engine
+	db             *database.DB
+	cache          *cache.RedisClient
+	rateLimiter    rateLimiter
+	jwtManager     *auth.JWTManager
+	logger         *zap.Logger
+	modelProxyURL  string // debate-orchestrator /api/v1/generate (аналитический режим)
+	simpleProxyURL string // debate-orchestrator /api/v1/simple    (обычный режим)
+	queryLimit     int
+	queryWindow    time.Duration
 }
+
+type rateLimiter interface {
+	AllowRateLimit(ctx context.Context, key string, limit int, window time.Duration) (bool, int, time.Duration, error)
+}
+
+//go:embed docs/api-gateway/openapi.yaml
+var apiGatewayOpenAPISpec []byte
+
+//go:embed docs/api-gateway/swagger-ui.html
+var apiGatewaySwaggerUI []byte
 
 func main() {
 	// Загрузка переменных окружения
@@ -80,14 +97,21 @@ func main() {
 	// Инициализация JWT менеджера
 	jwtSecret := getEnv("JWT_SECRET", "your-secret-key")
 	jwtManager := auth.NewJWTManager(jwtSecret, 24*time.Hour)
+	queryLimit := getEnvInt("QUERY_RATE_LIMIT_REQUESTS", 20)
+	queryWindow := time.Duration(getEnvInt("QUERY_RATE_LIMIT_WINDOW_SECONDS", 60)) * time.Second
 
 	// Создание сервера
 	server := &Server{
-		router:     gin.Default(),
-		db:         db,
-		cache:      redisClient,
-		jwtManager: jwtManager,
-		logger:     log,
+		router:         gin.Default(),
+		db:             db,
+		cache:          redisClient,
+		rateLimiter:    redisClient,
+		jwtManager:     jwtManager,
+		logger:         log,
+		modelProxyURL:  getEnv("DEBATE_ORCHESTRATOR_ANALYTICS_URL", "http://debate-orchestrator:8082/api/v1/generate"),
+		simpleProxyURL: getEnv("DEBATE_ORCHESTRATOR_SIMPLE_URL", "http://debate-orchestrator:8082/api/v1/simple"),
+		queryLimit:     queryLimit,
+		queryWindow:    queryWindow,
 	}
 
 	// Настройка маршрутов
@@ -98,9 +122,9 @@ func main() {
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      server.router,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  600 * time.Second,
+		WriteTimeout: 600 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	// Graceful shutdown
@@ -129,6 +153,9 @@ func main() {
 }
 
 func (s *Server) setupRoutes() {
+	s.router.GET("/openapi.yaml", s.handleOpenAPISpec)
+	s.router.GET("/docs", s.handleSwaggerUI)
+	s.router.GET("/docs/", s.handleSwaggerUI)
 	// Middleware
 	s.router.Use(gin.Recovery())
 	s.router.Use(s.corsMiddleware())
@@ -146,10 +173,20 @@ func (s *Server) setupRoutes() {
 	{
 		protected.POST("/query", s.handleQuery)
 		protected.GET("/history", s.handleHistory)
+		protected.PUT("/users/mode", s.handleSetMode)
+		protected.GET("/users/mode", s.handleGetMode)
 	}
 }
 
 // Middleware для CORS
+func (s *Server) handleOpenAPISpec(c *gin.Context) {
+	c.Data(http.StatusOK, "application/yaml; charset=utf-8", apiGatewayOpenAPISpec)
+}
+
+func (s *Server) handleSwaggerUI(c *gin.Context) {
+	c.Data(http.StatusOK, "text/html; charset=utf-8", apiGatewaySwaggerUI)
+}
+
 func (s *Server) corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
@@ -203,6 +240,39 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 }
 
 // Handler для авторизации
+func (s *Server) checkQueryRateLimit(c *gin.Context, userID string) bool {
+	if s.rateLimiter == nil || s.queryLimit <= 0 || s.queryWindow <= 0 {
+		return true
+	}
+
+	key := "rate_limit:query:" + userID
+	allowed, remaining, retryAfter, err := s.rateLimiter.AllowRateLimit(c.Request.Context(), key, s.queryLimit, s.queryWindow)
+	if err != nil {
+		s.logger.Warn("Failed to check query rate limit", zap.Error(err), zap.String("user_id", userID))
+		return true
+	}
+
+	c.Header("X-RateLimit-Limit", strconv.Itoa(s.queryLimit))
+	c.Header("X-RateLimit-Remaining", strconv.Itoa(remaining))
+	c.Header("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(retryAfter).Unix(), 10))
+
+	if allowed {
+		return true
+	}
+
+	retryAfterSeconds := int(retryAfter.Seconds())
+	if retryAfterSeconds < 1 {
+		retryAfterSeconds = 1
+	}
+	c.Header("Retry-After", strconv.Itoa(retryAfterSeconds))
+	c.JSON(http.StatusTooManyRequests, models.ErrorResponse{
+		Error:   "Rate limit exceeded",
+		Code:    http.StatusTooManyRequests,
+		Details: fmt.Sprintf("try again in %d seconds", retryAfterSeconds),
+	})
+	return false
+}
+
 func (s *Server) handleLogin(c *gin.Context) {
 	var req models.LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -214,7 +284,6 @@ func (s *Server) handleLogin(c *gin.Context) {
 		return
 	}
 
-	// Поиск пользователя в БД
 	var user models.User
 	query := `SELECT id, username, email, password_hash, created_at, updated_at 
 	          FROM users WHERE username = $1`
@@ -274,8 +343,7 @@ func (s *Server) handleLogin(c *gin.Context) {
 
 // Handler для обработки запросов к LLM
 func (s *Server) handleQuery(c *gin.Context) {
-	userID, _ := c.Get("user_id")
-	username, _ := c.Get("username")
+	serviceUserID, _ := c.Get("user_id")
 
 	var req models.QueryRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -287,41 +355,48 @@ func (s *Server) handleQuery(c *gin.Context) {
 		return
 	}
 
+	// Определяем реального пользователя: если бот передал telegram_id,
+	// находим или создаём запись в БД; иначе — используем аккаунт из JWT.
+	actualUserID := serviceUserID.(string)
+	if req.TelegramID != 0 {
+		tgUserID, err := s.findOrCreateTelegramUser(req.TelegramID, req.TelegramUsername)
+		if err != nil {
+			s.logger.Error("Failed to resolve Telegram user",
+				zap.Error(err), zap.Int64("telegram_id", req.TelegramID))
+		} else {
+			actualUserID = tgUserID
+		}
+	}
+
+	if !s.checkQueryRateLimit(c, actualUserID) {
+		return
+	}
+
 	s.logger.Info("Processing query",
-		zap.String("user_id", userID.(string)),
-		zap.String("username", username.(string)),
+		zap.String("user_id", actualUserID),
+		zap.Int64("telegram_id", req.TelegramID),
 		zap.String("prompt", req.Prompt[:min(50, len(req.Prompt))]),
 	)
 
 	startTime := time.Now()
 
-	// Проверка кэша
-	cacheKey := generateCacheKey(req.Prompt)
-	ctx := c.Request.Context()
+	// Получаем историю диалога и строим обогащённый промпт
+	history, err := s.getChatHistory(actualUserID, 10)
+	if err != nil {
+		s.logger.Warn("Failed to fetch chat history", zap.Error(err))
+	}
+	enrichedPrompt := buildPromptWithContext(history, req.Prompt)
 
-	cachedResponse, err := s.cache.Get(ctx, cacheKey)
-	if err == nil {
-		s.logger.Info("Cache hit", zap.String("cache_key", cacheKey))
-		processingTime := time.Since(startTime).Milliseconds()
-
-		c.JSON(http.StatusOK, models.QueryResponse{
-			Response:       cachedResponse,
-			ModelUsed:      "cache",
-			ProcessingTime: processingTime,
-		})
-		return
+	// Выбираем эндпоинт в зависимости от режима
+	proxyURL := s.modelProxyURL
+	if req.Mode == "simple" {
+		proxyURL = s.simpleProxyURL
 	}
 
-	// Отправка запроса к Model Proxy
-	modelProxyURL := "http://model-proxy:8081/api/v1/generate"
-
-	response, err := s.callModelProxy(modelProxyURL, req.Prompt)
+	response, modelUsed, err := s.callModelProxy(proxyURL, enrichedPrompt)
 	if err != nil {
-		s.logger.Error("Failed to call model proxy", zap.Error(err))
-
-		// Логирование ошибки
-		s.logQuery(userID.(string), req.Prompt, "", "", 0, "error", err.Error())
-
+		s.logger.Error("Failed to call debate orchestrator", zap.Error(err))
+		s.logQuery(actualUserID, req.Prompt, "", "", 0, "error", err.Error())
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
 			Error:   "Failed to process query",
 			Code:    http.StatusInternalServerError,
@@ -332,16 +407,16 @@ func (s *Server) handleQuery(c *gin.Context) {
 
 	processingTime := time.Since(startTime).Milliseconds()
 
-	// Сохранение в кэш
-	_ = s.cache.Set(ctx, cacheKey, response, 1*time.Hour)
+	// Сохраняем обмен в историю чата (оригинальный промпт, не обогащённый)
+	s.saveChatMessage(actualUserID, "user", req.Prompt)
+	s.saveChatMessage(actualUserID, "assistant", response)
 
-	// Логирование запроса
-	s.logQuery(userID.(string), req.Prompt, "llama3.2", response,
+	s.logQuery(actualUserID, req.Prompt, modelUsed, response,
 		int(processingTime), "success", "")
 
 	c.JSON(http.StatusOK, models.QueryResponse{
 		Response:       response,
-		ModelUsed:      "llama3.2",
+		ModelUsed:      modelUsed,
 		ProcessingTime: processingTime,
 	})
 }
@@ -402,7 +477,9 @@ func (s *Server) handleHealth(c *gin.Context) {
 	}
 
 	// Проверка Redis
-	if err := s.cache.HealthCheck(); err != nil {
+	if s.cache == nil {
+		checks["redis"] = "disabled"
+	} else if err := s.cache.HealthCheck(); err != nil {
 		checks["redis"] = "unhealthy: " + err.Error()
 	} else {
 		checks["redis"] = "healthy"
@@ -427,10 +504,11 @@ func (s *Server) handleHealth(c *gin.Context) {
 	})
 }
 
-// Вспомогательная функция для вызова Model Proxy
-func (s *Server) callModelProxy(url, prompt string) (string, error) {
+// Вспомогательная функция для вызова debate orchestrator.
+// Возвращает (response, modelUsed, error).
+func (s *Server) callModelProxy(url, prompt string) (string, string, error) {
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 540 * time.Second,
 	}
 
 	requestBody := map[string]interface{}{
@@ -439,31 +517,36 @@ func (s *Server) callModelProxy(url, prompt string) (string, error) {
 
 	jsonData, err := json.Marshal(requestBody)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	resp, err := client.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("model proxy returned status %d: %s", resp.StatusCode, string(body))
+		return "", "", fmt.Errorf("orchestrator returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	response, ok := result["response"].(string)
 	if !ok {
-		return "", fmt.Errorf("invalid response format")
+		return "", "", fmt.Errorf("invalid response format")
 	}
 
-	return response, nil
+	modelUsed, _ := result["model"].(string)
+	if modelUsed == "" {
+		modelUsed = "unknown"
+	}
+
+	return response, modelUsed, nil
 }
 
 // Логирование запроса в БД
@@ -486,17 +569,175 @@ func (s *Server) logQuery(userID, query, model, response string, latencyMS int, 
 	}
 }
 
-// Генерация ключа для кэша
-func generateCacheKey(prompt string) string {
-	hash := sha256.Sum256([]byte(prompt))
-	return "query:" + hex.EncodeToString(hash[:])
+// handleSetMode сохраняет выбранный режим для Telegram-пользователя.
+// PUT /api/v1/users/mode  body: {"telegram_id": 123, "mode": "simple"}
+func (s *Server) handleSetMode(c *gin.Context) {
+	var req models.SetModeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "Invalid request", Code: http.StatusBadRequest, Details: err.Error()})
+		return
+	}
+	if req.Mode != "simple" && req.Mode != "analytics" {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "mode must be 'simple' or 'analytics'", Code: http.StatusBadRequest})
+		return
+	}
+
+	_, err := s.db.Exec(
+		`UPDATE users SET preferred_mode = $1 WHERE telegram_id = $2`,
+		req.Mode, req.TelegramID,
+	)
+	if err != nil {
+		s.logger.Error("Failed to set user mode", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to update mode", Code: http.StatusInternalServerError})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"mode": req.Mode})
 }
 
+// handleGetMode возвращает сохранённый режим Telegram-пользователя.
+// GET /api/v1/users/mode?telegram_id=123
+func (s *Server) handleGetMode(c *gin.Context) {
+	telegramIDStr := c.Query("telegram_id")
+	if telegramIDStr == "" {
+		c.JSON(http.StatusBadRequest, models.ErrorResponse{Error: "telegram_id is required", Code: http.StatusBadRequest})
+		return
+	}
+
+	var mode string
+	err := s.db.QueryRow(
+		`SELECT COALESCE(preferred_mode, 'analytics') FROM users WHERE telegram_id = $1`,
+		telegramIDStr,
+	).Scan(&mode)
+
+	if err != nil {
+		// Пользователь ещё не создан — возвращаем дефолт
+		c.JSON(http.StatusOK, gin.H{"mode": "analytics"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"mode": mode})
+}
+
+// findOrCreateTelegramUser возвращает user_id для Telegram-пользователя,
+// создавая запись в БД при первом обращении.
+func (s *Server) findOrCreateTelegramUser(telegramID int64, username string) (string, error) {
+	var userID string
+	err := s.db.QueryRow(
+		`SELECT id FROM users WHERE telegram_id = $1`, telegramID,
+	).Scan(&userID)
+	if err == nil {
+		return userID, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", fmt.Errorf("lookup telegram user: %w", err)
+	}
+
+	// Пользователь не найден — создаём
+	safeUsername := fmt.Sprintf("tg_%d", telegramID)
+	email := fmt.Sprintf("tg_%d@telegram.local", telegramID)
+	// Пустой хэш пароля: такой пользователь авторизуется только через telegram_id
+	err = s.db.QueryRow(`
+		INSERT INTO users (username, email, password_hash, telegram_id)
+		VALUES ($1, $2, '', $3)
+		ON CONFLICT (telegram_id) DO UPDATE SET username = EXCLUDED.username
+		RETURNING id
+	`, safeUsername, email, telegramID).Scan(&userID)
+	if err != nil {
+		return "", fmt.Errorf("create telegram user: %w", err)
+	}
+
+	s.logger.Info("Created new Telegram user",
+		zap.Int64("telegram_id", telegramID),
+		zap.String("username", safeUsername),
+		zap.String("user_id", userID),
+	)
+	return userID, nil
+}
+
+// getChatHistory возвращает последние limit сообщений пользователя (в хронологическом порядке).
+func (s *Server) getChatHistory(userID string, limit int) ([]models.ChatMessage, error) {
+	rows, err := s.db.Query(`
+		SELECT id, user_id, role, content, created_at
+		FROM (
+			SELECT id, user_id, role, content, created_at
+			FROM chat_messages
+			WHERE user_id = $1
+			ORDER BY created_at DESC
+			LIMIT $2
+		) sub
+		ORDER BY created_at ASC
+	`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []models.ChatMessage
+	for rows.Next() {
+		var m models.ChatMessage
+		if err := rows.Scan(&m.ID, &m.UserID, &m.Role, &m.Content, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		messages = append(messages, m)
+	}
+	return messages, rows.Err()
+}
+
+// saveChatMessage сохраняет одно сообщение в истории диалога.
+func (s *Server) saveChatMessage(userID, role, content string) {
+	_, err := s.db.Exec(`
+		INSERT INTO chat_messages (user_id, role, content)
+		VALUES ($1, $2, $3)
+	`, userID, role, content)
+	if err != nil {
+		s.logger.Error("Failed to save chat message",
+			zap.String("user_id", userID),
+			zap.String("role", role),
+			zap.Error(err),
+		)
+	}
+}
+
+// buildPromptWithContext оборачивает текущий вопрос историей предыдущего диалога.
+func buildPromptWithContext(history []models.ChatMessage, prompt string) string {
+	if len(history) == 0 {
+		return prompt
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Контекст предыдущего диалога (используй его для более точного ответа):\n")
+	for _, msg := range history {
+		switch msg.Role {
+		case "user":
+			sb.WriteString("Пользователь: ")
+		case "assistant":
+			sb.WriteString("Ассистент: ")
+		}
+		sb.WriteString(msg.Content)
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\nТекущий вопрос пользователя: ")
+	sb.WriteString(prompt)
+	return sb.String()
+}
+
+// Генерация ключа для кэша (оставлен для возможного будущего использования)
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
 	}
 	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
 }
 
 func min(a, b int) int {
