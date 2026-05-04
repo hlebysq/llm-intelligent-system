@@ -161,7 +161,7 @@ paths:
       operationId: createQuery
       summary: Send prompt to LLM
       description: >
-        Processes a user prompt, enriches it with recent chat history, routes the request
+        Processes a user prompt, enriches it with a compact conversation summary and recent chat messages, routes the request
         to either the analytics or simple orchestrator, stores the interaction, and returns
         the final response. If `telegram_id` is provided, the gateway finds or creates the matching
         Telegram user and stores chat/query history under that user. Without `telegram_id`, history is
@@ -444,7 +444,7 @@ components:
         prompt:
           type: string
           minLength: 1
-          description: User prompt. The gateway prepends recent chat context before forwarding it to the orchestrator.
+          description: User prompt. The gateway prepends a compact conversation summary and recent chat messages before forwarding it to the orchestrator.
           example: Explain how retrieval augmented generation works.
         telegram_id:
           type: integer

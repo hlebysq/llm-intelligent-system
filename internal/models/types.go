@@ -26,6 +26,14 @@ type ChatMessage struct {
 	CreatedAt time.Time `json:"created_at" db:"created_at"`
 }
 
+// ChatSummary stores compact long-term conversation memory for a user.
+type ChatSummary struct {
+	UserID       string    `json:"user_id" db:"user_id"`
+	Summary      string    `json:"summary" db:"summary"`
+	MessageCount int       `json:"message_count" db:"message_count"`
+	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+}
+
 // QueryRequest представляет входящий запрос к LLM.
 type QueryRequest struct {
 	Prompt           string `json:"prompt" binding:"required"`

@@ -44,12 +44,13 @@ func newTestServer(t *testing.T, db *sql.DB, modelProxyURL string) *Server {
 	gin.SetMode(gin.TestMode)
 	jwtManager := auth.NewJWTManager(testJWTSecret, 24*time.Hour)
 	s := &Server{
-		router:        gin.New(),
-		db:            database.NewTestDB(db),
-		cache:         nil,
-		jwtManager:    jwtManager,
-		logger:        zap.NewNop(),
-		modelProxyURL: modelProxyURL,
+		router:         gin.New(),
+		db:             database.NewTestDB(db),
+		cache:          nil,
+		jwtManager:     jwtManager,
+		logger:         zap.NewNop(),
+		modelProxyURL:  modelProxyURL,
+		simpleProxyURL: modelProxyURL,
 	}
 	s.setupRoutes()
 	return s
@@ -69,14 +70,14 @@ func newAuthHeader(t *testing.T, userID, username string) string {
 // ─── pure functions ──────────────────────────────────────────────────────────
 
 func TestBuildPromptWithContext_NoHistory(t *testing.T) {
-	result := buildPromptWithContext(nil, "What is AI?")
+	result := buildPromptWithContext("", nil, "What is AI?")
 	if result != "What is AI?" {
 		t.Errorf("expected unchanged prompt, got: %q", result)
 	}
 }
 
 func TestBuildPromptWithContext_EmptyHistory(t *testing.T) {
-	result := buildPromptWithContext([]models.ChatMessage{}, "Hello")
+	result := buildPromptWithContext("", []models.ChatMessage{}, "Hello")
 	if result != "Hello" {
 		t.Errorf("empty history should return original prompt, got: %q", result)
 	}
@@ -87,7 +88,7 @@ func TestBuildPromptWithContext_ContainsHistory(t *testing.T) {
 		{Role: "user", Content: "What is ML?"},
 		{Role: "assistant", Content: "ML is machine learning."},
 	}
-	result := buildPromptWithContext(history, "Give me an example.")
+	result := buildPromptWithContext("", history, "Give me an example.")
 
 	checks := []string{
 		"What is ML?",
@@ -107,7 +108,7 @@ func TestBuildPromptWithContext_NewPromptAtEnd(t *testing.T) {
 	history := []models.ChatMessage{
 		{Role: "user", Content: "old question"},
 	}
-	result := buildPromptWithContext(history, "new question")
+	result := buildPromptWithContext("", history, "new question")
 
 	oldIdx := strings.Index(result, "old question")
 	newIdx := strings.Index(result, "new question")
@@ -116,6 +117,21 @@ func TestBuildPromptWithContext_NewPromptAtEnd(t *testing.T) {
 	}
 	if newIdx < oldIdx {
 		t.Error("new question should appear after old question")
+	}
+}
+
+func TestBuildPromptWithContext_IncludesSummary(t *testing.T) {
+	result := buildPromptWithContext("User prefers concise Go explanations.", nil, "What next?")
+
+	checks := []string{
+		"Conversation summary:",
+		"User prefers concise Go explanations.",
+		"What next?",
+	}
+	for _, s := range checks {
+		if !strings.Contains(result, s) {
+			t.Errorf("result should contain %q\nFull result:\n%s", s, result)
+		}
 	}
 }
 
@@ -452,7 +468,7 @@ func TestHandleQuery_Success(t *testing.T) {
 func TestHandleQuery_ContextInjectedIntoPrompt(t *testing.T) {
 	// Сохраняем тело запроса, пришедшего в оркестратор
 	type orchRequest struct{ body map[string]interface{} }
-	reqCh := make(chan orchRequest, 1)
+	reqCh := make(chan orchRequest, 2)
 
 	orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var b map[string]interface{}

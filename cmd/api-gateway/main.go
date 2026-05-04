@@ -381,11 +381,15 @@ func (s *Server) handleQuery(c *gin.Context) {
 	startTime := time.Now()
 
 	// Получаем историю диалога и строим обогащённый промпт
-	history, err := s.getChatHistory(actualUserID, 10)
+	summary, err := s.getChatSummary(actualUserID)
+	if err != nil {
+		s.logger.Warn("Failed to fetch chat summary", zap.Error(err))
+	}
+	history, err := s.getChatHistory(actualUserID, 6)
 	if err != nil {
 		s.logger.Warn("Failed to fetch chat history", zap.Error(err))
 	}
-	enrichedPrompt := buildPromptWithContext(history, req.Prompt)
+	enrichedPrompt := buildPromptWithContext(summary, history, req.Prompt)
 
 	// Выбираем эндпоинт в зависимости от режима
 	proxyURL := s.modelProxyURL
@@ -413,6 +417,10 @@ func (s *Server) handleQuery(c *gin.Context) {
 
 	s.logQuery(actualUserID, req.Prompt, modelUsed, response,
 		int(processingTime), "success", "")
+
+	if err := s.updateChatSummary(actualUserID, summary, req.Prompt, response); err != nil {
+		s.logger.Warn("Failed to update chat summary", zap.Error(err), zap.String("user_id", actualUserID))
+	}
 
 	c.JSON(http.StatusOK, models.QueryResponse{
 		Response:       response,
@@ -653,6 +661,20 @@ func (s *Server) findOrCreateTelegramUser(telegramID int64, username string) (st
 	return userID, nil
 }
 
+// getChatSummary returns compact long-term memory for the user conversation.
+func (s *Server) getChatSummary(userID string) (string, error) {
+	var summary string
+	err := s.db.QueryRow(`
+		SELECT summary
+		FROM chat_summaries
+		WHERE user_id = $1
+	`, userID).Scan(&summary)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return summary, err
+}
+
 // getChatHistory возвращает последние limit сообщений пользователя (в хронологическом порядке).
 func (s *Server) getChatHistory(userID string, limit int) ([]models.ChatMessage, error) {
 	rows, err := s.db.Query(`
@@ -697,25 +719,87 @@ func (s *Server) saveChatMessage(userID, role, content string) {
 	}
 }
 
-// buildPromptWithContext оборачивает текущий вопрос историей предыдущего диалога.
-func buildPromptWithContext(history []models.ChatMessage, prompt string) string {
-	if len(history) == 0 {
+// updateChatSummary refreshes compact memory after a successful assistant response.
+func (s *Server) updateChatSummary(userID, existingSummary, userPrompt, assistantResponse string) error {
+	summaryURL := s.simpleProxyURL
+	if summaryURL == "" {
+		summaryURL = s.modelProxyURL
+	}
+	if summaryURL == "" {
+		return fmt.Errorf("summary orchestrator URL is empty")
+	}
+
+	summaryPrompt := buildSummaryUpdatePrompt(existingSummary, userPrompt, assistantResponse)
+	updatedSummary, _, err := s.callModelProxy(summaryURL, summaryPrompt)
+	if err != nil {
+		return err
+	}
+
+	updatedSummary = strings.TrimSpace(updatedSummary)
+	if updatedSummary == "" {
+		return fmt.Errorf("summary orchestrator returned empty summary")
+	}
+
+	_, err = s.db.Exec(`
+		INSERT INTO chat_summaries (user_id, summary, message_count, updated_at)
+		VALUES ($1, $2, 2, CURRENT_TIMESTAMP)
+		ON CONFLICT (user_id) DO UPDATE SET
+			summary = EXCLUDED.summary,
+			message_count = chat_summaries.message_count + 2,
+			updated_at = CURRENT_TIMESTAMP
+	`, userID, updatedSummary)
+	return err
+}
+
+func buildSummaryUpdatePrompt(existingSummary, userPrompt, assistantResponse string) string {
+	if strings.TrimSpace(existingSummary) == "" {
+		existingSummary = "No previous summary."
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Update the conversation summary for future context.\n")
+	sb.WriteString("Keep it concise, factual, and in the same language as the conversation.\n")
+	sb.WriteString("Return only the updated summary without headings or markdown.\n\n")
+	sb.WriteString("Existing summary:\n")
+	sb.WriteString(existingSummary)
+	sb.WriteString("\n\nNew exchange:\nUser: ")
+	sb.WriteString(userPrompt)
+	sb.WriteString("\nAssistant: ")
+	sb.WriteString(assistantResponse)
+	return sb.String()
+}
+
+// buildPromptWithContext оборачивает текущий вопрос резюме и историей предыдущего диалога.
+func buildPromptWithContext(summary string, history []models.ChatMessage, prompt string) string {
+	summary = strings.TrimSpace(summary)
+	if summary == "" && len(history) == 0 {
 		return prompt
 	}
 
 	var sb strings.Builder
-	sb.WriteString("Контекст предыдущего диалога (используй его для более точного ответа):\n")
-	for _, msg := range history {
-		switch msg.Role {
-		case "user":
-			sb.WriteString("Пользователь: ")
-		case "assistant":
-			sb.WriteString("Ассистент: ")
+	if summary != "" {
+		sb.WriteString("Conversation summary:\n")
+		sb.WriteString(summary)
+		sb.WriteString("\n\n")
+	}
+	if len(history) > 0 {
+		sb.WriteString("Recent messages:\n")
+		for _, msg := range history {
+			switch msg.Role {
+			case "user":
+				sb.WriteString("Пользователь: ")
+			case "assistant":
+				sb.WriteString("Ассистент: ")
+			default:
+				sb.WriteString(msg.Role)
+				sb.WriteString(": ")
+			}
+			sb.WriteString(msg.Content)
+			sb.WriteString("\n")
 		}
-		sb.WriteString(msg.Content)
 		sb.WriteString("\n")
 	}
-	sb.WriteString("\nТекущий вопрос пользователя: ")
+	sb.WriteString("Current user question: ")
 	sb.WriteString(prompt)
 	return sb.String()
 }
