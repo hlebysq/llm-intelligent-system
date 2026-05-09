@@ -104,8 +104,8 @@ docker compose up -d --build
 Rate limiting настраивается в `.env`:
 
 ```env
-QUERY_RATE_LIMIT_REQUESTS=20
-QUERY_RATE_LIMIT_WINDOW_SECONDS=60
+ANALYTICS_DAILY_LIMIT=5
+SIMPLE_DAILY_LIMIT=20
 ```
 
 ## Частые команды

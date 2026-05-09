@@ -37,8 +37,8 @@ type Server struct {
 	logger         *zap.Logger
 	modelProxyURL  string // debate-orchestrator /api/v1/generate (аналитический режим)
 	simpleProxyURL string // debate-orchestrator /api/v1/simple    (обычный режим)
-	queryLimit     int
-	queryWindow    time.Duration
+	analyticsLimit int
+	simpleLimit    int
 }
 
 type rateLimiter interface {
@@ -99,8 +99,8 @@ func main() {
 	// Инициализация JWT менеджера
 	jwtSecret := getEnv("JWT_SECRET", "your-secret-key")
 	jwtManager := auth.NewJWTManager(jwtSecret, 24*time.Hour)
-	queryLimit := getEnvInt("QUERY_RATE_LIMIT_REQUESTS", 20)
-	queryWindow := time.Duration(getEnvInt("QUERY_RATE_LIMIT_WINDOW_SECONDS", 60)) * time.Second
+	analyticsLimit := getEnvInt("ANALYTICS_DAILY_LIMIT", 5)
+	simpleLimit := getEnvInt("SIMPLE_DAILY_LIMIT", 20)
 
 	// Создание сервера
 	server := &Server{
@@ -112,8 +112,8 @@ func main() {
 		logger:         log,
 		modelProxyURL:  getEnv("DEBATE_ORCHESTRATOR_ANALYTICS_URL", "http://debate-orchestrator:8082/api/v1/generate"),
 		simpleProxyURL: getEnv("DEBATE_ORCHESTRATOR_SIMPLE_URL", "http://debate-orchestrator:8082/api/v1/simple"),
-		queryLimit:     queryLimit,
-		queryWindow:    queryWindow,
+		analyticsLimit: analyticsLimit,
+		simpleLimit:    simpleLimit,
 	}
 
 	// Настройка маршрутов
@@ -242,21 +242,33 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 }
 
 // Handler для авторизации
-func (s *Server) checkQueryRateLimit(c *gin.Context, userID string) bool {
-	if s.rateLimiter == nil || s.queryLimit <= 0 || s.queryWindow <= 0 {
+func (s *Server) checkQueryRateLimit(c *gin.Context, userID, mode string) bool {
+	limit := s.dailyLimitForMode(mode)
+	if s.rateLimiter == nil || limit <= 0 {
 		return true
 	}
 
-	key := "rate_limit:query:" + userID
-	allowed, remaining, retryAfter, err := s.rateLimiter.AllowRateLimit(c.Request.Context(), key, s.queryLimit, s.queryWindow)
+	now := time.Now()
+	key := fmt.Sprintf("rate_limit:query:%s:%s:%s", mode, userID, now.Format("2006-01-02"))
+	window := time.Until(time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location()))
+	if window <= 0 {
+		window = 24 * time.Hour
+	}
+
+	allowed, remaining, retryAfter, err := s.rateLimiter.AllowRateLimit(c.Request.Context(), key, limit, window)
 	if err != nil {
-		s.logger.Warn("Failed to check query rate limit", zap.Error(err), zap.String("user_id", userID))
+		s.logger.Warn("Failed to check query rate limit",
+			zap.Error(err),
+			zap.String("user_id", userID),
+			zap.String("mode", mode),
+		)
 		return true
 	}
 
-	c.Header("X-RateLimit-Limit", strconv.Itoa(s.queryLimit))
+	c.Header("X-RateLimit-Limit", strconv.Itoa(limit))
 	c.Header("X-RateLimit-Remaining", strconv.Itoa(remaining))
 	c.Header("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(retryAfter).Unix(), 10))
+	c.Header("X-RateLimit-Mode", mode)
 
 	if allowed {
 		return true
@@ -270,9 +282,23 @@ func (s *Server) checkQueryRateLimit(c *gin.Context, userID string) bool {
 	c.JSON(http.StatusTooManyRequests, models.ErrorResponse{
 		Error:   "Rate limit exceeded",
 		Code:    http.StatusTooManyRequests,
-		Details: fmt.Sprintf("try again in %d seconds", retryAfterSeconds),
+		Details: fmt.Sprintf("%s daily limit exceeded, try again in %d seconds", mode, retryAfterSeconds),
 	})
 	return false
+}
+
+func (s *Server) dailyLimitForMode(mode string) int {
+	if mode == "simple" {
+		return s.simpleLimit
+	}
+	return s.analyticsLimit
+}
+
+func normalizeQueryMode(mode string) string {
+	if mode == "simple" {
+		return "simple"
+	}
+	return "analytics"
 }
 
 func (s *Server) handleLogin(c *gin.Context) {
@@ -369,8 +395,9 @@ func (s *Server) handleQuery(c *gin.Context) {
 			actualUserID = tgUserID
 		}
 	}
+	mode := normalizeQueryMode(req.Mode)
 
-	if !s.checkQueryRateLimit(c, actualUserID) {
+	if !s.checkQueryRateLimit(c, actualUserID, mode) {
 		return
 	}
 
@@ -395,7 +422,7 @@ func (s *Server) handleQuery(c *gin.Context) {
 
 	// Выбираем эндпоинт в зависимости от режима
 	proxyURL := s.modelProxyURL
-	if req.Mode == "simple" {
+	if mode == "simple" {
 		proxyURL = s.simpleProxyURL
 	}
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -246,6 +247,42 @@ func TestQueryLLM_ServerError(t *testing.T) {
 
 	if _, _, err := bot.queryLLM("q", 1, "u", modeAnalytics); err == nil {
 		t.Error("expected error on 500, got nil")
+	}
+}
+
+func TestQueryLLM_RateLimitExceeded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Mode", modeAnalytics)
+		http.Error(w, `{"error":"Rate limit exceeded"}`, http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	bot := &TelegramBot{
+		apiGatewayURL: srv.URL,
+		jwtToken:      "tok",
+		httpClient:    &http.Client{Timeout: 5 * time.Second},
+		logger:        zap.NewNop(),
+	}
+
+	_, _, err := bot.queryLLM("q", 1, "u", modeAnalytics)
+	if err == nil {
+		t.Fatal("expected rate limit error, got nil")
+	}
+	var limitErr *queryLimitError
+	if !errors.As(err, &limitErr) {
+		t.Fatalf("expected queryLimitError, got %T: %v", err, err)
+	}
+	if limitErr.mode != modeAnalytics {
+		t.Fatalf("expected analytics mode, got %q", limitErr.mode)
+	}
+}
+
+func TestDailyLimitMessage(t *testing.T) {
+	if !strings.Contains(dailyLimitMessage(modeAnalytics), "аналитических") {
+		t.Fatalf("analytics limit message should mention analytics limit")
+	}
+	if !strings.Contains(dailyLimitMessage(modeSimple), "обычных") {
+		t.Fatalf("simple limit message should mention simple limit")
 	}
 }
 

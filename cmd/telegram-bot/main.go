@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,6 +25,14 @@ const (
 	modeSimple    = "simple"
 	modeAnalytics = "analytics"
 )
+
+type queryLimitError struct {
+	mode string
+}
+
+func (e *queryLimitError) Error() string {
+	return "daily query limit exceeded for mode " + e.mode
+}
 
 type TelegramBot struct {
 	bot           *tgbotapi.BotAPI
@@ -426,6 +435,11 @@ func (tb *TelegramBot) handleMessage(message *tgbotapi.Message) {
 			zap.Error(res.err),
 			zap.Int64("chat_id", chatID),
 		)
+		var limitErr *queryLimitError
+		if errors.As(res.err, &limitErr) {
+			tb.editMessage(chatID, msgID, dailyLimitMessage(limitErr.mode))
+			return
+		}
 		tb.editMessage(chatID, msgID, "❌ Произошла ошибка при обработке запроса. Попробуйте позже.")
 		return
 	}
@@ -484,6 +498,13 @@ func (tb *TelegramBot) queryLLM(prompt string, telegramID int64, telegramUsernam
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			limitMode := resp.Header.Get("X-RateLimit-Mode")
+			if limitMode == "" {
+				limitMode = mode
+			}
+			return "", 0, &queryLimitError{mode: limitMode}
+		}
 		return "", 0, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -498,6 +519,15 @@ func (tb *TelegramBot) queryLLM(prompt string, telegramID int64, telegramUsernam
 	}
 
 	return queryResp.Response, queryResp.ProcessingTime, nil
+}
+
+func dailyLimitMessage(mode string) string {
+	switch mode {
+	case modeSimple:
+		return "Лимит обычных запросов на сегодня исчерпан. Попробуйте снова завтра или переключитесь на аналитический режим, если лимит там еще доступен."
+	default:
+		return "Лимит аналитических запросов на сегодня исчерпан. Попробуйте снова завтра или переключитесь на обычный режим."
+	}
 }
 
 // Обработка команды /history

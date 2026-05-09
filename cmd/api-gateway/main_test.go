@@ -32,10 +32,14 @@ type fakeRateLimiter struct {
 	retryAfter time.Duration
 	err        error
 	key        string
+	limit      int
+	window     time.Duration
 }
 
 func (f *fakeRateLimiter) AllowRateLimit(ctx context.Context, key string, limit int, window time.Duration) (bool, int, time.Duration, error) {
 	f.key = key
+	f.limit = limit
+	f.window = window
 	return f.allowed, f.remaining, f.retryAfter, f.err
 }
 
@@ -51,6 +55,8 @@ func newTestServer(t *testing.T, db *sql.DB, modelProxyURL string) *Server {
 		logger:         zap.NewNop(),
 		modelProxyURL:  modelProxyURL,
 		simpleProxyURL: modelProxyURL,
+		analyticsLimit: 5,
+		simpleLimit:    20,
 	}
 	s.setupRoutes()
 	return s
@@ -288,8 +294,7 @@ func TestHandleQuery_RateLimitExceeded(t *testing.T) {
 	limiter := &fakeRateLimiter{allowed: false, remaining: 0, retryAfter: 30 * time.Second}
 	s := newTestServer(t, db, "")
 	s.rateLimiter = limiter
-	s.queryLimit = 2
-	s.queryWindow = time.Minute
+	s.analyticsLimit = 2
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/query",
@@ -301,14 +306,49 @@ func TestHandleQuery_RateLimitExceeded(t *testing.T) {
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429, got %d: %s", w.Code, w.Body.String())
 	}
-	if limiter.key != "rate_limit:query:uid-rate" {
+	if !strings.HasPrefix(limiter.key, "rate_limit:query:analytics:uid-rate:") {
 		t.Fatalf("unexpected rate limit key: %q", limiter.key)
+	}
+	if limiter.limit != 2 {
+		t.Fatalf("expected analytics limit 2, got %d", limiter.limit)
 	}
 	if got := w.Header().Get("Retry-After"); got != "30" {
 		t.Fatalf("expected Retry-After=30, got %q", got)
 	}
 	if got := w.Header().Get("X-RateLimit-Limit"); got != "2" {
 		t.Fatalf("expected X-RateLimit-Limit=2, got %q", got)
+	}
+	if got := w.Header().Get("X-RateLimit-Mode"); got != "analytics" {
+		t.Fatalf("expected X-RateLimit-Mode=analytics, got %q", got)
+	}
+}
+
+func TestHandleQuery_SimpleRateLimitUsesSimpleDailyLimit(t *testing.T) {
+	db, _, _ := sqlmock.New()
+	defer db.Close()
+	limiter := &fakeRateLimiter{allowed: false, remaining: 0, retryAfter: time.Hour}
+	s := newTestServer(t, db, "")
+	s.rateLimiter = limiter
+	s.simpleLimit = 20
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/query",
+		bytes.NewBufferString(`{"prompt":"hello","mode":"simple"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", newAuthHeader(t, "uid-simple-rate", "testuser"))
+	s.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.HasPrefix(limiter.key, "rate_limit:query:simple:uid-simple-rate:") {
+		t.Fatalf("unexpected rate limit key: %q", limiter.key)
+	}
+	if limiter.limit != 20 {
+		t.Fatalf("expected simple limit 20, got %d", limiter.limit)
+	}
+	if limiter.window <= 0 || limiter.window > 24*time.Hour {
+		t.Fatalf("expected daily reset window, got %s", limiter.window)
 	}
 }
 

@@ -213,25 +213,30 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '429':
-          description: Query rate limit exceeded
+          description: Daily query rate limit exceeded. Analytics requests are limited separately from simple requests.
           headers:
             Retry-After:
-              description: Seconds until the current rate-limit window resets.
+              description: Seconds until the current daily rate-limit window resets.
               schema:
                 type: integer
             X-RateLimit-Limit:
-              description: Maximum number of query requests allowed in the window.
+              description: Maximum number of requests allowed for the selected mode today.
               schema:
                 type: integer
             X-RateLimit-Remaining:
-              description: Number of remaining query requests in the current window.
+              description: Number of remaining requests for the selected mode today.
               schema:
                 type: integer
             X-RateLimit-Reset:
-              description: Unix timestamp when the current window resets.
+              description: Unix timestamp when the current daily window resets.
               schema:
                 type: integer
                 format: int64
+            X-RateLimit-Mode:
+              description: Query mode whose daily limit was checked.
+              schema:
+                type: string
+                enum: [simple, analytics]
           content:
             application/json:
               schema:
