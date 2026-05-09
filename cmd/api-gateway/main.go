@@ -45,6 +45,8 @@ type rateLimiter interface {
 	AllowRateLimit(ctx context.Context, key string, limit int, window time.Duration) (bool, int, time.Duration, error)
 }
 
+const chatContextMessageLimit = 12
+
 //go:embed docs/api-gateway/openapi.yaml
 var apiGatewayOpenAPISpec []byte
 
@@ -385,7 +387,7 @@ func (s *Server) handleQuery(c *gin.Context) {
 	if err != nil {
 		s.logger.Warn("Failed to fetch chat summary", zap.Error(err))
 	}
-	history, err := s.getChatHistory(actualUserID, 6)
+	history, err := s.getChatHistory(actualUserID, chatContextMessageLimit)
 	if err != nil {
 		s.logger.Warn("Failed to fetch chat history", zap.Error(err))
 	}
@@ -432,44 +434,64 @@ func (s *Server) handleQuery(c *gin.Context) {
 // Handler для получения истории запросов
 func (s *Server) handleHistory(c *gin.Context) {
 	userID, _ := c.Get("user_id")
+	actualUserID := userID.(string)
+	if telegramID := c.Query("telegram_id"); telegramID != "" {
+		parsedTelegramID, err := strconv.ParseInt(telegramID, 10, 64)
+		if err != nil || parsedTelegramID <= 0 {
+			c.JSON(http.StatusBadRequest, models.ErrorResponse{
+				Error: "telegram_id must be a positive integer",
+				Code:  http.StatusBadRequest,
+			})
+			return
+		}
 
-	query := `
-		SELECT id, user_id, original_query, model_used, response_text, 
-		       latency_ms, status, error_message, created_at
-		FROM query_logs
-		WHERE user_id = $1
-		ORDER BY created_at DESC
-		LIMIT 50
-	`
+		tgUserID, err := s.findOrCreateTelegramUser(parsedTelegramID, "")
+		if err != nil {
+			s.logger.Error("Failed to resolve Telegram user",
+				zap.Error(err), zap.Int64("telegram_id", parsedTelegramID))
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+				Error: "Failed to fetch history",
+				Code:  http.StatusInternalServerError,
+			})
+			return
+		}
+		actualUserID = tgUserID
+	}
 
-	rows, err := s.db.Query(query, userID.(string))
+	summary, err := s.getChatSummaryDetails(actualUserID)
 	if err != nil {
-		s.logger.Error("Failed to fetch history", zap.Error(err))
+		s.logger.Error("Failed to fetch chat summary", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
 			Error: "Failed to fetch history",
 			Code:  http.StatusInternalServerError,
 		})
 		return
 	}
-	defer rows.Close()
 
-	var logs []models.QueryLog
-	for rows.Next() {
-		var log models.QueryLog
-		if err := rows.Scan(
-			&log.ID, &log.UserID, &log.OriginalQuery, &log.ModelUsed,
-			&log.ResponseText, &log.LatencyMS, &log.Status,
-			&log.ErrorMessage, &log.CreatedAt,
-		); err != nil {
-			s.logger.Error("Failed to scan row", zap.Error(err))
-			continue
-		}
-		logs = append(logs, log)
+	messages, err := s.getChatHistory(actualUserID, chatContextMessageLimit)
+	if err != nil {
+		s.logger.Error("Failed to fetch chat messages", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+			Error: "Failed to fetch history",
+			Code:  http.StatusInternalServerError,
+		})
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"history": logs,
-		"count":   len(logs),
+	var updatedAt *time.Time
+	if !summary.UpdatedAt.IsZero() {
+		updatedAt = &summary.UpdatedAt
+	}
+
+	c.JSON(http.StatusOK, models.ChatHistoryResponse{
+		Summary: models.ChatSummaryResponse{
+			Content:      summary.Summary,
+			MessageCount: summary.MessageCount,
+			UpdatedAt:    updatedAt,
+		},
+		Messages: messages,
+		Count:    len(messages),
+		Limit:    chatContextMessageLimit,
 	})
 }
 
@@ -663,14 +685,19 @@ func (s *Server) findOrCreateTelegramUser(telegramID int64, username string) (st
 
 // getChatSummary returns compact long-term memory for the user conversation.
 func (s *Server) getChatSummary(userID string) (string, error) {
-	var summary string
+	summary, err := s.getChatSummaryDetails(userID)
+	return summary.Summary, err
+}
+
+func (s *Server) getChatSummaryDetails(userID string) (models.ChatSummary, error) {
+	summary := models.ChatSummary{UserID: userID}
 	err := s.db.QueryRow(`
-		SELECT summary
+		SELECT user_id, summary, message_count, updated_at
 		FROM chat_summaries
 		WHERE user_id = $1
-	`, userID).Scan(&summary)
+	`, userID).Scan(&summary.UserID, &summary.Summary, &summary.MessageCount, &summary.UpdatedAt)
 	if err == sql.ErrNoRows {
-		return "", nil
+		return summary, nil
 	}
 	return summary, err
 }

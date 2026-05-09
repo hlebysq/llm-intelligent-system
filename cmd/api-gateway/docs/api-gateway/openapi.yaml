@@ -245,17 +245,25 @@ paths:
   /api/v1/history:
     get:
       tags: [Queries]
-      operationId: getQueryHistory
-      summary: Get query history
+      operationId: getChatContextHistory
+      summary: Get chat context history
       description: >
-        Returns up to 50 latest query log entries for the authenticated JWT user, ordered from newest to oldest.
-        For Telegram conversations, query logs are written under the resolved Telegram user, so the service
-        account history may differ from end-user history.
+        Returns the compact conversation summary and the latest 12 chat messages for the authenticated JWT user,
+        ordered from oldest to newest. This is the same context shape the gateway uses to enrich future prompts.
       security:
         - BearerAuth: []
+      parameters:
+        - in: query
+          name: telegram_id
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+          description: Optional Telegram user ID. When present, history is returned for the resolved Telegram user instead of the authenticated service user.
       responses:
         '200':
-          description: Query history
+          description: Chat context history
           content:
             application/json:
               schema:
@@ -263,16 +271,23 @@ paths:
               examples:
                 withItems:
                   value:
-                    history:
-                      - id: 72af6f2b-7f0a-4a81-9f0c-106c51c0fc35
+                    summary:
+                      content: User is learning retrieval augmented generation and prefers concise examples.
+                      message_count: 18
+                      updated_at: '2026-04-29T01:22:00Z'
+                    messages:
+                      - id: d571e3f4-f5fb-4f64-9a43-821f5276ec0a
                         user_id: 22663de0-b0e9-4366-8ab3-dedaf1748179
-                        original_query: Explain how retrieval augmented generation works.
-                        model_used: debate-ensemble
-                        response_text: Retrieval augmented generation combines search with model inference.
-                        latency_ms: 1520
-                        status: success
+                        role: user
+                        content: Explain how retrieval augmented generation works.
                         created_at: '2026-04-29T01:20:00Z'
-                    count: 1
+                      - id: 0a5d72b1-9ccd-4fc5-96f3-70511abe8b88
+                        user_id: 22663de0-b0e9-4366-8ab3-dedaf1748179
+                        role: assistant
+                        content: Retrieval augmented generation combines search with model inference.
+                        created_at: '2026-04-29T01:20:02Z'
+                    limit: 12
+                    count: 2
         '401':
           description: Missing or invalid JWT token
           content:
@@ -481,7 +496,7 @@ components:
     ChatMessage:
       type: object
       required: [id, user_id, role, content, created_at]
-      description: Internal chat-history record used to enrich future prompts. It is not returned by the public API today.
+      description: Chat-history record used to enrich future prompts.
       properties:
         id:
           type: string
@@ -545,15 +560,38 @@ components:
           example: '2026-04-29T01:20:00Z'
     HistoryResponse:
       type: object
-      required: [history, count]
+      required: [summary, messages, count, limit]
       properties:
-        history:
+        summary:
+          $ref: '#/components/schemas/ChatSummary'
+        messages:
           type: array
           items:
-            $ref: '#/components/schemas/QueryLog'
+            $ref: '#/components/schemas/ChatMessage'
         count:
           type: integer
           example: 12
+        limit:
+          type: integer
+          example: 12
+    ChatSummary:
+      type: object
+      required: [content, message_count]
+      properties:
+        content:
+          type: string
+          description: Compact long-term conversation summary.
+          example: User is learning retrieval augmented generation and prefers concise examples.
+        message_count:
+          type: integer
+          minimum: 0
+          description: Number of chat messages incorporated into the summary.
+          example: 18
+        updated_at:
+          type: string
+          format: date-time
+          description: Last summary update time. Omitted when summary has not been created yet.
+          example: '2026-04-29T01:22:00Z'
     SetModeRequest:
       type: object
       required: [telegram_id, mode]

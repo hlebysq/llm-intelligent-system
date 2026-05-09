@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.uber.org/zap"
 )
@@ -25,6 +26,65 @@ func TestGetEnv_SetValue(t *testing.T) {
 	t.Setenv("TEST_BOT_GETENV", "hello")
 	if got := getEnv("TEST_BOT_GETENV", "default"); got != "hello" {
 		t.Errorf("expected hello, got: %q", got)
+	}
+}
+
+func TestTruncateRunes_KeepsUTF8Valid(t *testing.T) {
+	input := "Привет, мир 👋 это длинный текст"
+	got := truncateRunes(input, 12)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncateRunes returned invalid UTF-8: %q", got)
+	}
+	if got == input {
+		t.Fatal("expected text to be truncated")
+	}
+}
+
+func TestBuildHistoryMessage_UserReadableAndUserOnly(t *testing.T) {
+	now := time.Date(2026, 5, 5, 12, 30, 0, 0, time.UTC)
+	message := buildHistoryMessage(
+		historySummaryView{Content: "User is exploring project context."},
+		[]historyMessageView{
+			{Role: "user", Content: "First user question", CreatedAt: now},
+			{Role: "assistant", Content: "Assistant answer that should be hidden", CreatedAt: now},
+			{Role: "user", Content: "Second user question", CreatedAt: now},
+		},
+		12,
+	)
+
+	checks := []string{
+		"Память диалога",
+		"показываю только ваши последние сообщения",
+		"Ваши последние сохраненные сообщения (2 из 6)",
+		"User is exploring project context.",
+		"First user question",
+		"Second user question",
+	}
+	for _, check := range checks {
+		if !strings.Contains(message, check) {
+			t.Fatalf("expected history message to contain %q\nFull message:\n%s", check, message)
+		}
+	}
+	if strings.Contains(message, "Assistant answer that should be hidden") {
+		t.Fatalf("assistant message should not be shown\nFull message:\n%s", message)
+	}
+}
+
+func TestBuildHistoryMessage_AllowsMarkdownSpecialChars(t *testing.T) {
+	now := time.Date(2026, 5, 5, 12, 30, 0, 0, time.UTC)
+	message := buildHistoryMessage(
+		historySummaryView{Content: "User asked food questions."},
+		[]historyMessageView{
+			{Role: "user", Content: "Как правильно разбивать яйцо*", CreatedAt: now},
+		},
+		12,
+	)
+
+	if !utf8.ValidString(message) {
+		t.Fatalf("history message should be valid UTF-8: %q", message)
+	}
+	if !strings.Contains(message, "Как правильно разбивать яйцо*") {
+		t.Fatalf("expected message to keep user text verbatim\nFull message:\n%s", message)
 	}
 }
 
@@ -108,8 +168,8 @@ func TestQueryLLM_Success(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"response":          "42 is the answer.",
-			"model_used":        "debate-ensemble",
+			"response":           "42 is the answer.",
+			"model_used":         "debate-ensemble",
 			"processing_time_ms": int64(1234),
 		})
 	}))
@@ -233,4 +293,45 @@ func TestQueryLLM_ReAuthOnExpiredToken(t *testing.T) {
 	if resp != "answer after reauth" {
 		t.Errorf("unexpected response: %q", resp)
 	}
+}
+
+func TestHandleHistoryCommand_PassesTelegramID(t *testing.T) {
+	reqCh := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqCh <- r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"summary": map[string]interface{}{
+				"content":       "short summary",
+				"message_count": 2,
+			},
+			"messages": []map[string]interface{}{
+				{
+					"role":       "user",
+					"content":    "hello",
+					"created_at": time.Now().Format(time.RFC3339),
+				},
+			},
+			"count": 1,
+			"limit": 6,
+		})
+	}))
+	defer srv.Close()
+
+	bot := &TelegramBot{
+		apiGatewayURL: srv.URL,
+		jwtToken:      "test-token",
+		httpClient:    &http.Client{Timeout: 5 * time.Second},
+		logger:        zap.NewNop(),
+	}
+
+	defer func() {
+		_ = recover()
+		query := <-reqCh
+		if !strings.Contains(query, "telegram_id=777000") {
+			t.Fatalf("expected telegram_id in history request query, got %q", query)
+		}
+	}()
+
+	bot.handleHistoryCommandV2(777000)
 }

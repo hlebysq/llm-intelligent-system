@@ -34,6 +34,19 @@ type ChatSummary struct {
 	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
 }
 
+type ChatSummaryResponse struct {
+	Content      string     `json:"content"`
+	MessageCount int        `json:"message_count"`
+	UpdatedAt    *time.Time `json:"updated_at,omitempty"`
+}
+
+type ChatHistoryResponse struct {
+	Summary  ChatSummaryResponse `json:"summary"`
+	Messages []ChatMessage       `json:"messages"`
+	Count    int                 `json:"count"`
+	Limit    int                 `json:"limit"`
+}
+
 // QueryRequest представляет входящий запрос к LLM.
 type QueryRequest struct {
 	Prompt           string `json:"prompt" binding:"required"`

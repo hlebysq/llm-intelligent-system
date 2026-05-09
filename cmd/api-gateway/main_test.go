@@ -312,6 +312,98 @@ func TestHandleQuery_RateLimitExceeded(t *testing.T) {
 	}
 }
 
+func TestHandleHistory_ReturnsSummaryAndRecentMessages(t *testing.T) {
+	db, mock, _ := sqlmock.New()
+	defer db.Close()
+	userID := "uid-history"
+	updatedAt := time.Date(2026, 5, 5, 12, 30, 0, 0, time.UTC)
+
+	mock.ExpectQuery("SELECT user_id, summary, message_count, updated_at").
+		WithArgs(userID).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "summary", "message_count", "updated_at"}).
+			AddRow(userID, "User prefers short answers about Go.", 12, updatedAt))
+
+	mock.ExpectQuery("SELECT id, user_id, role, content, created_at").
+		WithArgs(userID, chatContextMessageLimit).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "role", "content", "created_at"}).
+			AddRow("m1", userID, "user", "What is context?", updatedAt.Add(-time.Minute)).
+			AddRow("m2", userID, "assistant", "It is compact memory plus recent messages.", updatedAt))
+
+	s := newTestServer(t, db, "")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/history", nil)
+	req.Header.Set("Authorization", newAuthHeader(t, userID, "testuser"))
+	s.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp models.ChatHistoryResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Summary.Content != "User prefers short answers about Go." {
+		t.Fatalf("unexpected summary: %q", resp.Summary.Content)
+	}
+	if resp.Summary.MessageCount != 12 {
+		t.Fatalf("unexpected summary message count: %d", resp.Summary.MessageCount)
+	}
+	if resp.Summary.UpdatedAt == nil || !resp.Summary.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("unexpected summary updated_at: %v", resp.Summary.UpdatedAt)
+	}
+	if resp.Count != 2 || resp.Limit != chatContextMessageLimit {
+		t.Fatalf("unexpected count/limit: count=%d limit=%d", resp.Count, resp.Limit)
+	}
+	if len(resp.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(resp.Messages))
+	}
+	if resp.Messages[0].Role != "user" || resp.Messages[0].Content != "What is context?" {
+		t.Fatalf("unexpected first message: %+v", resp.Messages[0])
+	}
+	if resp.Messages[1].Role != "assistant" {
+		t.Fatalf("unexpected second message: %+v", resp.Messages[1])
+	}
+}
+
+func TestHandleHistory_ResolvesTelegramUser(t *testing.T) {
+	db, mock, _ := sqlmock.New()
+	defer db.Close()
+	serviceUID := "service-uid"
+	tgUID := "tg-history-user"
+
+	mock.ExpectQuery("SELECT id FROM users WHERE telegram_id").
+		WithArgs(int64(777000)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(tgUID))
+	mock.ExpectQuery("SELECT user_id, summary, message_count, updated_at").
+		WithArgs(tgUID).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery("SELECT id, user_id, role, content, created_at").
+		WithArgs(tgUID, chatContextMessageLimit).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "role", "content", "created_at"}).
+			AddRow("m1", tgUID, "user", "telegram question", time.Now()))
+
+	s := newTestServer(t, db, "")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/history?telegram_id=777000", nil)
+	req.Header.Set("Authorization", newAuthHeader(t, serviceUID, "telegram_bot"))
+	s.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp models.ChatHistoryResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(resp.Messages) != 1 || resp.Messages[0].UserID != tgUID {
+		t.Fatalf("expected telegram user's messages, got: %+v", resp.Messages)
+	}
+}
+
 func TestHandleLogin_InvalidJSON(t *testing.T) {
 	db, _, _ := sqlmock.New()
 	defer db.Close()

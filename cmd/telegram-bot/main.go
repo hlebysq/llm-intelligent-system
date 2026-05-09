@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -295,7 +296,7 @@ func (tb *TelegramBot) handleCommand(message *tgbotapi.Message) {
 				"/start - начать работу\n"+
 				"/help - помощь\n"+
 				"/mode - сменить режим обработки\n"+
-				"/history - история запросов",
+				"/history - контекст диалога",
 		)
 
 	case "help":
@@ -316,7 +317,7 @@ func (tb *TelegramBot) handleCommand(message *tgbotapi.Message) {
 		tb.handleModeCommand(message.Chat.ID)
 
 	case "history":
-		tb.handleHistoryCommand(message.Chat.ID)
+		tb.handleHistoryCommandV2(message.Chat.ID)
 
 	default:
 		tb.sendMessage(message.Chat.ID,
@@ -500,6 +501,118 @@ func (tb *TelegramBot) queryLLM(prompt string, telegramID int64, telegramUsernam
 }
 
 // Обработка команды /history
+func (tb *TelegramBot) handleHistoryCommandV2(chatID int64) {
+	historyURL := fmt.Sprintf("%s/api/v1/history?telegram_id=%d", tb.apiGatewayURL, chatID)
+
+	req, err := http.NewRequest(http.MethodGet, historyURL, nil)
+	if err != nil {
+		tb.sendMessage(chatID, "Failed to create history request")
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+tb.jwtToken)
+
+	resp, err := tb.httpClient.Do(req)
+	if err != nil {
+		tb.sendMessage(chatID, "Failed to load history")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		tb.sendMessage(chatID, "Could not load history")
+		return
+	}
+
+	var historyResp struct {
+		Summary struct {
+			Content      string     `json:"content"`
+			MessageCount int        `json:"message_count"`
+			UpdatedAt    *time.Time `json:"updated_at"`
+		} `json:"summary"`
+		Messages []struct {
+			Role      string    `json:"role"`
+			Content   string    `json:"content"`
+			CreatedAt time.Time `json:"created_at"`
+		} `json:"messages"`
+		Count int `json:"count"`
+		Limit int `json:"limit"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&historyResp); err != nil {
+		tb.sendMessage(chatID, "Failed to parse history response")
+		return
+	}
+
+	messages := make([]historyMessageView, 0, len(historyResp.Messages))
+	for _, item := range historyResp.Messages {
+		messages = append(messages, historyMessageView{
+			Role:      item.Role,
+			Content:   item.Content,
+			CreatedAt: item.CreatedAt,
+		})
+	}
+	message := buildHistoryMessage(historySummaryView{
+		Content:      historyResp.Summary.Content,
+		MessageCount: historyResp.Summary.MessageCount,
+		UpdatedAt:    historyResp.Summary.UpdatedAt,
+	}, messages, historyResp.Limit)
+	if message == "" {
+		tb.sendMessage(chatID, "History is empty")
+		return
+	}
+
+	tb.logger.Debug(message)
+	tb.sendPlainMessage(chatID, message)
+}
+
+func buildHistoryMessage(summary historySummaryView, messages []historyMessageView, limit int) string {
+	userMessages := make([]historyMessageView, 0, len(messages))
+	for _, item := range messages {
+		if item.Role == "user" {
+			userMessages = append(userMessages, item)
+		}
+	}
+
+	if len(userMessages) == 0 && summary.Content == "" {
+		return ""
+	}
+
+	message := "Память диалога\n\n"
+	message += "Это контекст, который я храню по нашему разговору. Он помогает мне лучше понимать уточняющие вопросы и не терять нить беседы.\n\n"
+	message += "Summary - это короткое сжатое резюме ранней части диалога. Ниже я показываю только ваши последние сообщения; ответы ассистента тут скрыты.\n\n"
+	if summary.Content != "" {
+		message += "Summary:\n" + summary.Content + "\n\n"
+	} else {
+		message += "Summary пока не создан. Оно появится, когда в диалоге накопится достаточно контекста.\n\n"
+	}
+	if len(userMessages) > 0 {
+		userLimit := limit / 2
+		if userLimit < len(userMessages) {
+			userLimit = len(userMessages)
+		}
+		message += fmt.Sprintf("Ваши последние сохраненные сообщения (%d из %d):\n\n", len(userMessages), userLimit)
+		for i, item := range userMessages {
+			content := truncateRunes(item.Content, 120)
+			message += fmt.Sprintf("%d. %s\n   %s\n\n", i+1, content, item.CreatedAt.Format("02.01 15:04"))
+		}
+	} else {
+		message += "Ваших сообщений в последнем окне контекста пока нет.\n"
+	}
+	return message
+}
+
+type historySummaryView struct {
+	Content      string
+	MessageCount int
+	UpdatedAt    *time.Time
+}
+
+type historyMessageView struct {
+	Role      string
+	Content   string
+	CreatedAt time.Time
+}
+
 func (tb *TelegramBot) handleHistoryCommand(chatID int64) {
 	historyURL := tb.apiGatewayURL + "/api/v1/history"
 
@@ -524,6 +637,16 @@ func (tb *TelegramBot) handleHistoryCommand(chatID int64) {
 	}
 
 	var historyResp struct {
+		Summary struct {
+			Content      string     `json:"content"`
+			MessageCount int        `json:"message_count"`
+			UpdatedAt    *time.Time `json:"updated_at"`
+		} `json:"summary"`
+		Messages []struct {
+			Role      string    `json:"role"`
+			Content   string    `json:"content"`
+			CreatedAt time.Time `json:"created_at"`
+		} `json:"messages"`
 		History []struct {
 			OriginalQuery string    `json:"original_query"`
 			ModelUsed     string    `json:"model_used"`
@@ -531,6 +654,7 @@ func (tb *TelegramBot) handleHistoryCommand(chatID int64) {
 			CreatedAt     time.Time `json:"created_at"`
 		} `json:"history"`
 		Count int `json:"count"`
+		Limit int `json:"limit"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&historyResp); err != nil {
@@ -538,7 +662,34 @@ func (tb *TelegramBot) handleHistoryCommand(chatID int64) {
 		return
 	}
 
-	if historyResp.Count == 0 {
+	if historyResp.Count == 0 && historyResp.Summary.Content == "" {
+		tb.sendMessage(chatID, "рџ“­ РСЃС‚РѕСЂРёСЏ Р·Р°РїСЂРѕСЃРѕРІ РїСѓСЃС‚Р°")
+		return
+	}
+
+	historyMessage := "рџ“љ РљРѕРЅС‚РµРєСЃС‚ РґРёР°Р»РѕРіР°\n\n"
+	if historyResp.Summary.Content != "" {
+		historyMessage += "Summary:\n" + historyResp.Summary.Content + "\n\n"
+	}
+	if historyResp.Count > 0 {
+		historyMessage += fmt.Sprintf("РџРѕСЃР»РµРґРЅРёРµ СЃРѕРѕР±С‰РµРЅРёСЏ (%d/%d):\n\n", historyResp.Count, historyResp.Limit)
+		for i, item := range historyResp.Messages {
+			content := item.Content
+			if len(content) > 120 {
+				content = content[:117] + "..."
+			}
+			role := "User"
+			if item.Role == "assistant" {
+				role = "Assistant"
+			}
+			historyMessage += fmt.Sprintf("%d. %s: %s\n   %s\n\n", i+1, role, content, item.CreatedAt.Format("02.01 15:04"))
+		}
+	}
+	tb.logger.Debug(historyMessage)
+	tb.sendMessage(chatID, historyMessage)
+	return
+
+	if false && historyResp.Count == 0 {
 		tb.sendMessage(chatID, "📭 История запросов пуста")
 		return
 	}
@@ -571,6 +722,7 @@ func (tb *TelegramBot) handleHistoryCommand(chatID int64) {
 
 // Отправка сообщения пользователю
 func (tb *TelegramBot) sendMessage(chatID int64, text string) {
+	text = sanitizeTelegramText(text)
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "Markdown"
 
@@ -582,8 +734,21 @@ func (tb *TelegramBot) sendMessage(chatID int64, text string) {
 	}
 }
 
+func (tb *TelegramBot) sendPlainMessage(chatID int64, text string) {
+	text = sanitizeTelegramText(text)
+	msg := tgbotapi.NewMessage(chatID, text)
+
+	if _, err := tb.bot.Send(msg); err != nil {
+		tb.logger.Error("Failed to send message",
+			zap.Error(err),
+			zap.Int64("chat_id", chatID),
+		)
+	}
+}
+
 // Отправка сообщения с возвратом объекта (нужен MessageID для последующих правок)
 func (tb *TelegramBot) sendMessageAndGetID(chatID int64, text string) (tgbotapi.Message, error) {
+	text = sanitizeTelegramText(text)
 	msg := tgbotapi.NewMessage(chatID, text)
 	sent, err := tb.bot.Send(msg)
 	if err != nil {
@@ -594,6 +759,7 @@ func (tb *TelegramBot) sendMessageAndGetID(chatID int64, text string) (tgbotapi.
 
 // Редактирование уже отправленного сообщения
 func (tb *TelegramBot) editMessage(chatID int64, messageID int, text string) {
+	text = sanitizeTelegramText(text)
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	if _, err := tb.bot.Send(edit); err != nil {
 		tb.logger.Warn("Failed to edit message",
@@ -602,6 +768,24 @@ func (tb *TelegramBot) editMessage(chatID int64, messageID int, text string) {
 			zap.Int("message_id", messageID),
 		)
 	}
+}
+
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(strings.ToValidUTF8(s, ""))
+	if len(runes) <= max {
+		return string(runes)
+	}
+	if max <= 3 {
+		return string(runes[:max])
+	}
+	return string(runes[:max-3]) + "..."
+}
+
+func sanitizeTelegramText(text string) string {
+	return strings.ToValidUTF8(text, "")
 }
 
 func getEnv(key, defaultValue string) string {
