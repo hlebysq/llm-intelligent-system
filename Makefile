@@ -30,3 +30,6 @@ restart: down up ## Перезапуск всех сервисов
 
 test: ## Запуск тестов
 	go test -v ./...
+
+migrate: ## Apply pending database migrations
+	docker-compose run --rm migrate

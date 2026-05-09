@@ -65,23 +65,32 @@ curl -i http://localhost:8085/openapi.yaml
 
 ## Миграции
 
-Папка `migrations` подключена в контейнер Postgres как `/docker-entrypoint-initdb.d`.
+Миграции применяются отдельным one-shot контейнером `migrate`, собранным из `cmd/migrate/Dockerfile`.
+Postgres больше не запускает SQL-файлы через `/docker-entrypoint-initdb.d`.
 
-Postgres автоматически выполняет эти SQL-файлы только при первом создании пустого volume. Если база уже была создана раньше, новые миграции нужно применять вручную.
-
-Прогнать конкретную новую миграцию:
-
-```powershell
-docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/005_chat_summaries.sql'
-```
-
-Проверить, что таблица появилась:
+При обычном запуске:
 
 ```powershell
-docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "\dt chat_summaries"'
+docker compose up -d --build
 ```
 
-Полностью пересоздать базу и применить все init SQL заново:
+сначала стартует `postgres`, затем `migrate` применяет все новые SQL-файлы из папки `migrations`, после чего запускается `api-gateway`.
+
+Мигратор хранит примененные версии в таблице `schema_migrations`, поэтому уже выполненные файлы повторно не запускаются.
+
+Запустить миграции вручную:
+
+```powershell
+docker compose run --rm migrate
+```
+
+Проверить примененные версии:
+
+```powershell
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT version, applied_at FROM schema_migrations ORDER BY version"'
+```
+
+Полностью пересоздать базу и применить миграции заново:
 
 ```powershell
 docker compose down -v
